@@ -11,7 +11,6 @@ import numpy as np
 import io
 import os
 import pypdfium2 as pdfium
-from difflib import SequenceMatcher
 
 # PDF生成ライブラリ
 from reportlab.lib.pagesizes import A4
@@ -76,6 +75,7 @@ def load_ocr_reader():
     return easyocr.Reader(['en'], gpu=False)
 
 def clean_code(s):
+    """ハイフン・記号を除去し英数字のみにする"""
     s = str(s).upper()
     s = re.sub(r'[^A-Z0-9]', '', s)
     s = s.replace('O', '0').replace('I', '1').replace('Z', '2').replace('S', '5')
@@ -93,28 +93,19 @@ def build_clean_master(master_dict):
     return clean_list
 
 def match_master(text, clean_master):
-    """厳密さを維持したマスター照合ロジック"""
+    """誤検知を防ぐ厳密マッチング"""
     c_text = clean_code(text)
 
-    if len(c_text) < 5:
+    if len(c_text) < 6:
         return None
 
-    # XIJPなどの非対象仕様が含まれる場合は除外
-    if "XIJP" in c_text or "XI" in text.upper():
+    # XIJPや非対象仕様を完全弾き
+    if "XIJP" in text.upper() or "XI" in text.upper():
         return None
 
+    # 完全一致のみ許可（部分一致を禁止して誤検出を防止）
     for m in clean_master:
-        # スズキ品番またはパイオニア品番との高精度マッチング
-        if m['s_clean'] in c_text or c_text in m['s_clean']:
-            return (m['s_orig'], m['p_orig'])
-        if m['p_clean'] in c_text or c_text in m['p_clean']:
-            return (m['s_orig'], m['p_orig'])
-
-    # 類似度判定（1文字違いレベルのみ許容）
-    for m in clean_master:
-        ratio_s = SequenceMatcher(None, m['s_clean'], c_text).ratio()
-        ratio_p = SequenceMatcher(None, m['p_clean'], c_text).ratio()
-        if ratio_s > 0.88 or ratio_p > 0.88:
+        if c_text == m['s_clean'] or c_text == m['p_clean']:
             return (m['s_orig'], m['p_orig'])
 
     return None
@@ -151,7 +142,6 @@ def parse_single_page(ocr_results, clean_master):
             rows.append({'y_mean': box['y'], 'items': [box]})
 
     page_items = []
-    suspicious_codes = []
 
     for row in rows:
         row_items = sorted(row['items'], key=lambda b: b['x'])
@@ -189,7 +179,7 @@ def parse_single_page(ocr_results, clean_master):
                     "パイオ品番": p_code
                 })
 
-    return page_items, date_val, suspicious_codes
+    return page_items, date_val
 
 def create_instruction_pdf(items, date_val):
     buffer = io.BytesIO()
@@ -360,14 +350,14 @@ if uploaded_files:
                         image = page.render(scale=2).to_pil()
                         img_np = np.array(image)
                         res = reader.readtext(img_np, detail=1)
-                        p_items, p_date, _ = parse_single_page(res, clean_master)
+                        p_items, p_date = parse_single_page(res, clean_master)
                         all_items.extend(p_items)
                         if p_date:
                             latest_date = p_date
                 else:
                     img = cv2.imdecode(np.frombuffer(file_bytes, np.uint8), cv2.IMREAD_COLOR)
                     res = reader.readtext(img, detail=1)
-                    p_items, p_date, _ = parse_single_page(res, clean_master)
+                    p_items, p_date = parse_single_page(res, clean_master)
                     all_items.extend(p_items)
                     if p_date:
                         latest_date = p_date
