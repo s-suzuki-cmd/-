@@ -92,31 +92,24 @@ def match_master(text, clean_master):
     raw_upper = text.upper()
     c_text = clean_code(text)
 
-    if len(c_text) < 3:
+    if len(c_text) < 4:
         return None
 
+    # 絶対除外対象（XIJP等）
     if "XIJP" in raw_upper or "XI" in raw_upper:
         return None
 
-    # 特殊個別レスキュー
-    if ("84553" in c_text or "84SS3" in raw_upper) or ("1740" in c_text):
-        return ("9919D-84SS3-R00", "TS-F1740ZSE3")
-
-    if ("835T3" in c_text or "83ST3" in raw_upper) or ("1640" in c_text):
-        return ("9919D-83ST3-R00", "TS-F1640ZSE4")
-
-    # 標準照合
+    # 正確なマスター照合（部分一致の暴走を防止）
     for m in clean_master:
         p_cl = m['p_clean']
         s_cl = m['s_clean']
 
-        if p_cl in c_text or c_text in p_cl:
+        # 完全一致または主要部分の合致のみ許可
+        if p_cl in c_text or s_cl in c_text:
             return (m['s_orig'], m['p_orig'])
-
-        if len(c_text) >= 5 and (p_cl.startswith(c_text) or c_text.startswith(p_cl[:5])):
-            return (m['s_orig'], m['p_orig'])
-
-        if s_cl in c_text or (len(c_text) >= 6 and s_cl.startswith(c_text)):
+            
+        # 記号を除いた時に十分な長さで一致する場合
+        if len(c_text) >= 8 and (c_text in p_cl or c_text in s_cl):
             return (m['s_orig'], m['p_orig'])
 
     return None
@@ -142,13 +135,13 @@ def parse_single_page(ocr_results, clean_master):
     date_match = re.search(r'(\d{2,4}/\d{1,2}/\d{1,2})', full_text)
     date_val = date_match.group(1) if date_match else ""
 
-    # Y軸（行）のグループ化幅を 16 -> 28px に緩和（ズレ吸収）
+    # Y軸グループ化の幅を適度に調整 (18px)
     parsed_boxes.sort(key=lambda b: b['y'])
     rows = []
     for box in parsed_boxes:
         placed = False
         for row in rows:
-            if abs(row['y_mean'] - box['y']) < 28:
+            if abs(row['y_mean'] - box['y']) < 18:
                 row['items'].append(box)
                 row['y_mean'] = sum(b['y'] for b in row['items']) / len(row['items'])
                 placed = True
@@ -161,51 +154,53 @@ def parse_single_page(ocr_results, clean_master):
     for row in rows:
         row_items = sorted(row['items'], key=lambda b: b['x'])
         
-        # 行内のテキストを全パターン結合して検査（文字が離れて分割された場合対策）
-        combined_texts = []
-        for i in range(len(row_items)):
-            combined_texts.append((row_items[i]['text'], i, row_items[i]['x']))
-            if i < len(row_items) - 1:
-                # 隣接テキストの合体版
-                comb_txt = row_items[i]['text'] + row_items[i+1]['text']
-                combined_texts.append((comb_txt, i, row_items[i]['x']))
-
         hit_master = None
         hit_idx = -1
         hit_x = 0
 
-        for txt, idx, x_pos in combined_texts:
-            hit = match_master(txt, clean_master)
+        # 行内の各アイテムを順にチェック
+        for idx, item in enumerate(row_items):
+            hit = match_master(item['text'], clean_master)
             if hit:
                 hit_master = hit
                 hit_idx = idx
-                hit_x = x_pos
+                hit_x = item['x']
                 break
+
+        # 1個単体で見つからなかった場合、隣同士を結合してチェック
+        if not hit_master and len(row_items) > 1:
+            for idx in range(len(row_items) - 1):
+                combined = row_items[idx]['text'] + row_items[idx+1]['text']
+                hit = match_master(combined, clean_master)
+                if hit:
+                    hit_master = hit
+                    hit_idx = idx
+                    hit_x = row_items[idx]['x']
+                    break
 
         if hit_master:
             s_code, p_code = hit_master
             qty = ""
             
-            # 数量の探索（離れた位置の数字も許容）
-            for item in row_items:
+            # 品番の右側にある数値（数量）を探す（距離制限350px以内）
+            for item in row_items[hit_idx + 1:]:
+                if item['x'] - hit_x > 350:
+                    continue
                 txt = item['text'].replace(',', '').replace(' ', '')
-                if txt.isdigit() and 1 <= int(txt) <= 9999:
+                if txt.isdigit() and 1 <= int(txt) <= 999:
                     qty = int(txt)
                     break
             
-            # 数量が見つからなくても、とりあえず1個として仮採用（現場漏れ防止）
-            if qty == "":
-                qty = 1
-
-            # 重複判定
-            is_dup = any(p['スズキ品番'] == s_code and p['指示数'] == qty for p in page_items)
-            if not is_dup:
-                page_items.append({
-                    "指示日": date_val,
-                    "指示数": qty,
-                    "スズキ品番": s_code,
-                    "パイオ品番": p_code
-                })
+            if qty != "":
+                # 完全重複の排除
+                is_dup = any(p['スズキ品番'] == s_code and p['指示数'] == qty for p in page_items)
+                if not is_dup:
+                    page_items.append({
+                        "指示日": date_val,
+                        "指示数": qty,
+                        "スズキ品番": s_code,
+                        "パイオ品番": p_code
+                    })
 
     return page_items, date_val, debug_texts
 
@@ -363,7 +358,7 @@ uploaded_files = st.file_uploader("ピッキングリスト（PDF / 画像）を
 
 if uploaded_files:
     if st.button("🚀 解析して指示書を作成", type="primary"):
-        with st.spinner("🔍 ページ単位で超高精度解析中..."):
+        with st.spinner("🔍 ページ単位で高精度解析中..."):
             reader = load_ocr_reader()
             clean_master = build_clean_master(st.session_state.target_master)
             all_items = []
