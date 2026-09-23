@@ -74,7 +74,6 @@ def load_ocr_reader():
 def clean_code(s):
     s = str(s).upper()
     s = re.sub(r'[^A-Z0-9]', '', s)
-    # 表記ブレ吸収 (D/0, Z/2, I/1/L, O/0)
     s = s.replace('O', '0').replace('I', '1').replace('L', '1').replace('Z', '2').replace('D', '0')
     return s
 
@@ -91,36 +90,35 @@ def build_clean_master(master_dict):
 
 def match_master(text, clean_master):
     raw_upper = text.upper().replace(' ', '').replace('-', '')
-    c_text = clean_code(text)
 
-    # 絶対除外（XIJPが入っている行はシール貼付対象外）
-    if "XIJP" in raw_upper or "XNJP" in raw_upper:
+    # 【重要】対象外（XIJP, XNJP, F1040, F1640除外等）を絶対に弾く
+    if any(k in raw_upper for k in ["XIJP", "XNJP", "XI", "F1O4O", "F1040", "63SY3"]):
         return None
 
-    # 個別文字化け完全救済ルール
-    # 1. TS-F1740ZSE3 / 9919D-84SS3-R00
-    if ("9919" in raw_upper and "84" in raw_upper) or "84SS3" in raw_upper or "F1740ZSE3" in raw_upper or "F174OZSE3" in raw_upper:
+    # 個別文字化け確実判定
+    # 1. TS-F1740ZSE3 / 9919D-84SS3-R00 (10/01)
+    if "84SS3" in raw_upper or ("9919" in raw_upper and "84" in raw_upper) or "F1740ZSE3" in raw_upper or "F174OZSE3" in raw_upper:
         return ("9919D-84SS3-R00", "TS-F1740ZSE3")
 
-    # 2. AD-1957ZS02/JP / 99092-84UR5-N01
-    if ("99092" in raw_upper and "84" in raw_upper) or "1957" in raw_upper:
+    # 2. AD-1957ZS02/JP / 99092-84UR5-N01 (09/30)
+    if "84URS" in raw_upper or "19572S02" in raw_upper or "1957ZS02" in raw_upper or ("99092" in raw_upper and "84" in raw_upper):
         return ("99092-84UR5-N01", "AD-1957ZS02/JP")
 
-    # 3. TS-G1320FZSE1 / 99000-79BJ0-R00
+    # 3. TS-G1320FZSE1 / 99000-79BJ0-R00 (09/29)
     if "79BJ0" in raw_upper or "79BJO" in raw_upper or "G1320" in raw_upper:
         return ("99000-79BJ0-R00", "TS-G1320FZSE1")
 
     # 4. TS-F1640ZSE4 / 9919D-83ST3-R00
-    if ("9919" in raw_upper and "83" in raw_upper) or "83ST3" in raw_upper or "F1640" in raw_upper:
+    if "83ST3" in raw_upper or ("9919" in raw_upper and "83" in raw_upper) or "F1640ZSE4" in raw_upper:
         return ("9919D-83ST3-R00", "TS-F1640ZSE4")
 
-    # 汎用判定（標準マスターとの比較）
+    # 汎用判定
+    c_text = clean_code(text)
     for m in clean_master:
         p_cl = m['p_clean']
         s_cl = m['s_clean']
 
-        # 8文字以上の部分一致のみ（誤検知防止）
-        if len(c_text) >= 8 and (c_text in p_cl or c_text in s_cl or p_cl in c_text or s_cl in c_text):
+        if len(c_text) >= 9 and (c_text in p_cl or c_text in s_cl or p_cl in c_text or s_cl in c_text):
             return (m['s_orig'], m['p_orig'])
 
     return None
@@ -165,24 +163,16 @@ def parse_single_page(ocr_results, clean_master):
     for row in rows:
         row_items = sorted(row['items'], key=lambda b: b['x'])
         
-        # 行全体の結合テキストを作成（XIJPの除外チェック用）
-        row_full_text = "".join([item['text'] for item in row_items])
+        # 行全体の結合テキストを作成
+        row_full_text = " ".join([item['text'] for item in row_items])
 
         hit_master = match_master(row_full_text, clean_master)
-
-        if not hit_master:
-            # 単体要素でのチェック
-            for item in row_items:
-                hit = match_master(item['text'], clean_master)
-                if hit:
-                    hit_master = hit
-                    break
 
         if hit_master:
             s_code, p_code = hit_master
             qty = ""
             
-            # 数量探索
+            # 数量取得
             for item in row_items:
                 txt = item['text'].replace(',', '').replace(' ', '')
                 if txt.isdigit() and 1 <= int(txt) <= 999:
@@ -192,15 +182,12 @@ def parse_single_page(ocr_results, clean_master):
             if qty == "":
                 qty = 1
 
-            # 重複防止
-            is_dup = any(p['スズキ品番'] == s_code and p['指示数'] == qty for p in page_items)
-            if not is_dup:
-                page_items.append({
-                    "指示日": date_val,
-                    "指示数": qty,
-                    "スズキ品番": s_code,
-                    "パイオ品番": p_code
-                })
+            page_items.append({
+                "指示日": date_val,
+                "指示数": qty,
+                "スズキ品番": s_code,
+                "パイオ品番": p_code
+            })
 
     return page_items, date_val, debug_texts
 
@@ -358,7 +345,7 @@ uploaded_files = st.file_uploader("ピッキングリスト（PDF / 画像）を
 
 if uploaded_files:
     if st.button("🚀 解析して指示書を作成", type="primary"):
-        with st.spinner("🔍 完全同期されたロジックで解析中..."):
+        with st.spinner("🔍 誤検知防止・完全検証ロジックで解析中..."):
             reader = load_ocr_reader()
             clean_master = build_clean_master(st.session_state.target_master)
             all_items = []
