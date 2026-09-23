@@ -74,7 +74,6 @@ def load_ocr_reader():
     return easyocr.Reader(['en'], gpu=False)
 
 def clean_code(s):
-    """英数字のみ抽出し正規化（OCR誤読補正付き）"""
     s = str(s).upper()
     s = re.sub(r'[^A-Z0-9]', '', s)
     s = s.replace('O', '0').replace('I', '1').replace('Z', '2').replace('S', '5')
@@ -92,29 +91,36 @@ def build_clean_master(master_dict):
     return clean_list
 
 def match_master(text, clean_master):
-    """【社内部番（パイオニア品番）メインで判定するロジック】"""
+    """社内部番重視 ＋ 末尾読み取り漏れ補正 ＋ 対象外仕様(XIJP)完全除外"""
     raw_upper = text.upper()
     c_text = clean_code(text)
 
     if len(c_text) < 4:
         return None
 
-    # 非対象モデル（XIJP等）は明確に除外
-    if "XIJP" in raw_upper or "XI" in raw_upper:
+    # 対象外仕様（XIJP, XI, 84SS3000）を絶対除外
+    if "XIJP" in raw_upper or "XI" in raw_upper or "84SS3000" in c_text:
         return None
 
-    # 最優先: 社内部番（パイオニア品番）との照合
     for m in clean_master:
-        # パイオニア品番がテキストに含まれているか
-        if m['p_clean'] in c_text or c_text in m['p_clean']:
-            return (m['s_orig'], m['p_orig'])
-        # 類似度判定（パイオニア品番の1文字誤読を救済）
-        if SequenceMatcher(None, m['p_clean'], c_text).ratio() > 0.80:
+        p_cl = m['p_clean']
+        s_cl = m['s_clean']
+
+        # 1. 完全・部分一致
+        if p_cl in c_text or c_text in p_cl:
             return (m['s_orig'], m['p_orig'])
 
-    # 補助判定: スズキ品番との完全・高精度一致（社内部番で引っかからなかった場合のみ）
+        # 2. 末尾枝番（E3等）がOCRで切れた場合の補正 (TSF1740ZS 等の前方一致)
+        if len(c_text) >= 7 and p_cl.startswith(c_text):
+            return (m['s_orig'], m['p_orig'])
+
+        # 3. スズキ品番からの補正
+        if s_cl in c_text or (len(c_text) >= 9 and s_cl.startswith(c_text)):
+            return (m['s_orig'], m['p_orig'])
+
+    # 類似度判定
     for m in clean_master:
-        if m['s_clean'] in c_text and len(c_text) >= 10:
+        if SequenceMatcher(None, m['p_clean'], c_text).ratio() > 0.75:
             return (m['s_orig'], m['p_orig'])
 
     return None
