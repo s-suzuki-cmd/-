@@ -11,6 +11,7 @@ import numpy as np
 import io
 import os
 import pypdfium2 as pdfium
+from difflib import SequenceMatcher
 
 # PDF生成ライブラリ
 from reportlab.lib.pagesizes import A4
@@ -49,11 +50,12 @@ TARGET_MASTER = {
     "99000-79Y27-PF1": "AN-ZH09ZS-71A",
     "99000-79BP4-000": "CD-1317ZS",
     "99000-79Y64-000": "CD-7756ZS-E1",
+    "99000-79X94-000": "CD-VRM200ZS-E1",  # ← 新規追加
     "9909J-78RM5-N01": "CD-HM022ZSE1",
     "3A108-65T00-000": "CNMV-0159ZS/EU",
     "3A108-65T01-000": "CNMV-0259ZS/EU",
     "3A108-65T10-000": "CNMV-0259ZS/AU",
-    "3A108-65T11-000": "CNMV-0259ZS02/AU",
+    "3A108-65T11-000": "CNMV-0259ZS/AU",
     "99093-55ZR3-N03": "KJ-S103DKZSE1",
     "99000-79W33-000": "ND-ETC3367ZS",
     "99000-79X52-000": "RD-7446ZS",
@@ -68,17 +70,55 @@ TARGET_MASTER = {
 def clean_code(s):
     s = str(s).upper()
     s = re.sub(r'[^A-Z0-9]', '', s)
-    return s.replace('O', '0').replace('I', '1').replace('Z', '2')
+    s = s.replace('O', '0').replace('I', '1').replace('Z', '2').replace('S', '5')
+    return s
 
-CLEAN_MASTER = {}
+def get_base_code(s):
+    c = clean_code(s)
+    return c[:10] if len(c) >= 10 else c
+
+CLEAN_MASTER = []
 for s_code, p_code in TARGET_MASTER.items():
     s_clean = clean_code(s_code)
     p_clean = clean_code(p_code)
-    CLEAN_MASTER[s_clean] = (s_code, p_code)
-    CLEAN_MASTER[p_clean] = (s_code, p_code)
+    s_base = get_base_code(s_code)
+    p_base = get_base_code(p_code)
+    
+    CLEAN_MASTER.append({
+        's_orig': s_code,
+        'p_orig': p_code,
+        's_clean': s_clean,
+        'p_clean': p_clean,
+        's_base': s_base,
+        'p_base': p_base
+    })
+
+def match_master(text):
+    c_text = clean_code(text)
+    base_text = get_base_code(text)
+
+    if len(c_text) < 5:
+        return None
+
+    for m in CLEAN_MASTER:
+        if (m['s_clean'] in c_text or c_text in m['s_clean'] or 
+            m['p_clean'] in c_text or c_text in m['p_clean']):
+            return (m['s_orig'], m['p_orig'])
+
+    for m in CLEAN_MASTER:
+        if (m['s_base'] in base_text or base_text in m['s_base'] or
+            m['p_base'] in base_text or base_text in m['p_base']):
+            return (m['s_orig'], m['p_orig'])
+
+    for m in CLEAN_MASTER:
+        ratio_s = SequenceMatcher(None, m['s_clean'], c_text).ratio()
+        ratio_p = SequenceMatcher(None, m['p_clean'], c_text).ratio()
+        if ratio_s > 0.82 or ratio_p > 0.82:
+            return (m['s_orig'], m['p_orig'])
+
+    return None
 
 def parse_single_page(ocr_results):
-    """1ページ単位で高精度解析"""
     parsed_boxes = []
     full_text = ""
     for item in ocr_results:
@@ -93,17 +133,15 @@ def parse_single_page(ocr_results):
             'x': x_left
         })
 
-    # 指示日抽出
     date_match = re.search(r'(\d{2,4}/\d{1,2}/\d{1,2})', full_text)
     date_val = date_match.group(1) if date_match else ""
 
-    # Y座標（高さ）で1行ごとに精密グループ化（許容誤差12px）
     parsed_boxes.sort(key=lambda b: b['y'])
     rows = []
     for box in parsed_boxes:
         placed = False
         for row in rows:
-            if abs(row['y_mean'] - box['y']) < 12:
+            if abs(row['y_mean'] - box['y']) < 14:
                 row['items'].append(box)
                 row['y_mean'] = sum(b['y'] for b in row['items']) / len(row['items'])
                 placed = True
@@ -114,35 +152,26 @@ def parse_single_page(ocr_results):
     page_items = []
 
     for row in rows:
-        row_items = sorted(row['items'], key=lambda b: b['x']) # X座標順（左から右）
+        row_items = sorted(row['items'], key=lambda b: b['x'])
         
         hit_master = None
         hit_idx = -1
         hit_x = 0
 
-        # 行内にマスター品番が含まれているか検証
         for idx, item in enumerate(row_items):
-            c_text = item['clean']
-            if len(c_text) < 5:
-                continue
-            
-            for m_clean, (s_orig, p_orig) in CLEAN_MASTER.items():
-                if m_clean in c_text or c_text in m_clean:
-                    hit_master = (s_orig, p_orig)
-                    hit_idx = idx
-                    hit_x = item['x']
-                    break
-            if hit_master:
+            hit = match_master(item['text'])
+            if hit:
+                hit_master = hit
+                hit_idx = idx
+                hit_x = item['x']
                 break
 
         if hit_master:
             s_code, p_code = hit_master
             qty = ""
             
-            # 品番の直右（位置が近くX座標が右側にある数値のみ）を「指示数」と判定
             for item in row_items[hit_idx + 1:]:
-                # 品番から離れすぎている数値（進捗在庫数など）を除外するため、X位置の差をチェック
-                if item['x'] - hit_x > 350:
+                if item['x'] - hit_x > 400:
                     continue
                     
                 txt = item['text'].replace(',', '').replace(' ', '')
@@ -327,7 +356,6 @@ if uploaded_files:
                         image = page.render(scale=2).to_pil()
                         img_np = np.array(image)
                         res = reader.readtext(img_np, detail=1)
-                        # ページ毎に独立解析
                         p_items, p_date = parse_single_page(res)
                         all_items.extend(p_items)
                         if p_date:
