@@ -77,7 +77,8 @@ for s_code, p_code in TARGET_MASTER.items():
     CLEAN_MASTER[s_clean] = (s_code, p_code)
     CLEAN_MASTER[p_clean] = (s_code, p_code)
 
-def parse_picking_list_strict(ocr_results):
+def parse_single_page(ocr_results):
+    """1ページ単位で高精度解析"""
     parsed_boxes = []
     full_text = ""
     for item in ocr_results:
@@ -92,15 +93,17 @@ def parse_picking_list_strict(ocr_results):
             'x': x_left
         })
 
+    # 指示日抽出
     date_match = re.search(r'(\d{2,4}/\d{1,2}/\d{1,2})', full_text)
     date_val = date_match.group(1) if date_match else ""
 
+    # Y座標（高さ）で1行ごとに精密グループ化（許容誤差12px）
     parsed_boxes.sort(key=lambda b: b['y'])
     rows = []
     for box in parsed_boxes:
         placed = False
         for row in rows:
-            if abs(row['y_mean'] - box['y']) < 20:
+            if abs(row['y_mean'] - box['y']) < 12:
                 row['items'].append(box)
                 row['y_mean'] = sum(b['y'] for b in row['items']) / len(row['items'])
                 placed = True
@@ -108,14 +111,16 @@ def parse_picking_list_strict(ocr_results):
         if not placed:
             rows.append({'y_mean': box['y'], 'items': [box]})
 
-    found_items = []
+    page_items = []
 
     for row in rows:
-        row_items = sorted(row['items'], key=lambda b: b['x'])
+        row_items = sorted(row['items'], key=lambda b: b['x']) # X座標順（左から右）
         
         hit_master = None
         hit_idx = -1
+        hit_x = 0
 
+        # 行内にマスター品番が含まれているか検証
         for idx, item in enumerate(row_items):
             c_text = item['clean']
             if len(c_text) < 5:
@@ -125,6 +130,7 @@ def parse_picking_list_strict(ocr_results):
                 if m_clean in c_text or c_text in m_clean:
                     hit_master = (s_orig, p_orig)
                     hit_idx = idx
+                    hit_x = item['x']
                     break
             if hit_master:
                 break
@@ -133,22 +139,26 @@ def parse_picking_list_strict(ocr_results):
             s_code, p_code = hit_master
             qty = ""
             
+            # 品番の直右（位置が近くX座標が右側にある数値のみ）を「指示数」と判定
             for item in row_items[hit_idx + 1:]:
+                # 品番から離れすぎている数値（進捗在庫数など）を除外するため、X位置の差をチェック
+                if item['x'] - hit_x > 350:
+                    continue
+                    
                 txt = item['text'].replace(',', '').replace(' ', '')
                 if txt.isdigit() and 1 <= int(txt) <= 9999:
                     qty = int(txt)
                     break
             
-            # 合算せず、そのまま件数として追加
             if qty != "":
-                found_items.append({
+                page_items.append({
                     "指示日": date_val,
                     "指示数": qty,
                     "スズキ品番": s_code,
                     "パイオ品番": p_code
                 })
 
-    return found_items, date_val
+    return page_items, date_val
 
 # --- 印刷用日本語PDF生成関数 ---
 def create_instruction_pdf(items, date_val):
@@ -303,14 +313,13 @@ uploaded_files = st.file_uploader("ピッキングリスト（PDF / 画像）を
 
 if uploaded_files:
     if st.button("🚀 解析して指示書を作成", type="primary"):
-        with st.spinner("🔍 ファイルを順次解析中..."):
+        with st.spinner("🔍 ページ単位で高精度解析中..."):
             reader = load_ocr_reader()
             all_items = []
             latest_date = ""
 
             for file in uploaded_files:
                 file_bytes = file.read()
-                ocr_results = []
 
                 if file.name.lower().endswith(".pdf"):
                     pdf = pdfium.PdfDocument(file_bytes)
@@ -318,16 +327,18 @@ if uploaded_files:
                         image = page.render(scale=2).to_pil()
                         img_np = np.array(image)
                         res = reader.readtext(img_np, detail=1)
-                        ocr_results.extend(res)
+                        # ページ毎に独立解析
+                        p_items, p_date = parse_single_page(res)
+                        all_items.extend(p_items)
+                        if p_date:
+                            latest_date = p_date
                 else:
                     img = cv2.imdecode(np.frombuffer(file_bytes, np.uint8), cv2.IMREAD_COLOR)
                     res = reader.readtext(img, detail=1)
-                    ocr_results.extend(res)
-
-                items, date_val = parse_picking_list_strict(ocr_results)
-                all_items.extend(items)
-                if date_val:
-                    latest_date = date_val
+                    p_items, p_date = parse_single_page(res)
+                    all_items.extend(p_items)
+                    if p_date:
+                        latest_date = p_date
 
             st.session_state.parsed_items = all_items
             st.session_state.parsed_date = latest_date
