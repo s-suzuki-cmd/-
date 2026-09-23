@@ -10,7 +10,6 @@ from datetime import datetime
 import numpy as np
 import io
 import os
-import urllib.request
 import pypdfium2 as pdfium
 
 # PDF生成ライブラリ
@@ -18,7 +17,6 @@ from reportlab.lib.pagesizes import A4
 from reportlab.lib import colors
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.pdfgen import canvas
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 
@@ -28,32 +26,17 @@ st.set_page_config(page_title="ピッキングリスト自動解析＆シール�
 st.title("📦 パイオニアラベル貼付 作業指示解析ツール")
 st.write("ピッキングリスト（PDF / 画像）を読み込み、**「作業時間記録Excel」** と **「現場用 印刷指示シート(PDF)」** を自動生成します。")
 
-# --- 日本語フォントの安全な読み込み設定 ---
-FONT_NAME = "Helvetica" # デフォルトフォント
+# --- 日本語フォント設定 ---
+FONT_NAME = "Helvetica" # デフォルト
 
-def init_pdf_font():
-    global FONT_NAME
-    # 外部ダウンロードでエラーが出ないようヘッダー付きで取得を試みる
-    target_font_path = "ipaexg.ttf"
-    if not os.path.exists(target_font_path):
-        try:
-            req = urllib.request.Request(
-                "https://raw.githubusercontent.com/google/fonts/main/ofl/ipaexgothic/IPAexGothic.ttf",
-                headers={'User-Agent': 'Mozilla/5.0'}
-            )
-            with urllib.request.urlopen(req, timeout=5) as response, open(target_font_path, 'wb') as out_file:
-                out_file.write(response.read())
-        except Exception:
-            pass
-
-    if os.path.exists(target_font_path):
-        try:
-            pdfmetrics.registerFont(TTFont("IPAexGothic", target_font_path))
-            FONT_NAME = "IPAexGothic"
-        except Exception:
-            FONT_NAME = "Helvetica"
-
-init_pdf_font()
+# 同一ディレクトリ内の IPAexGothic.ttf を検索・登録
+font_file = "IPAexGothic.ttf"
+if os.path.exists(font_file):
+    try:
+        pdfmetrics.registerFont(TTFont("IPAexGothic", font_file))
+        FONT_NAME = "IPAexGothic"
+    except Exception:
+        FONT_NAME = "Helvetica"
 
 # --- OCRモデルのキャッシュ化 ---
 @st.cache_resource
@@ -101,11 +84,10 @@ def create_instruction_pdf(items, date_val):
     elements = []
     styles = getSampleStyleSheet()
 
-    # フォント切り替え対応スタイル
     is_jp = (FONT_NAME == "IPAexGothic")
 
     title_text = "<b>【作業指示書】 パイオニアラベル貼付作業</b>" if is_jp else "<b>[ WORK INSTRUCTION ] Pioneer Label Attachment</b>"
-    sub_text = f"指示日 (Date): <b>{date_val if date_val else 'N/A'}</b> &nbsp;&nbsp;|&nbsp;&nbsp; 発行日時: {datetime.now().strftime('%Y/%m/%d %H:%M')}"
+    sub_text = f"指示日: <b>{date_val if date_val else '未特定'}</b> &nbsp;&nbsp;|&nbsp;&nbsp; 発行日時: {datetime.now().strftime('%Y/%m/%d %H:%M')}" if is_jp else f"Date: <b>{date_val if date_val else 'N/A'}</b> &nbsp;&nbsp;|&nbsp;&nbsp; Issued: {datetime.now().strftime('%Y/%m/%d %H:%M')}"
     
     title_style = ParagraphStyle('TitlePDF', parent=styles['Heading1'], fontName=FONT_NAME, fontSize=16, leading=20, alignment=1)
     sub_style = ParagraphStyle('SubPDF', parent=styles['Normal'], fontName=FONT_NAME, fontSize=10, leading=14, alignment=1)
@@ -121,7 +103,6 @@ def create_instruction_pdf(items, date_val):
         no_item_msg = "<b>本日、パイオニアラベル貼付の対象品番はありません。</b>" if is_jp else "<b>No target items today.</b>"
         elements.append(Paragraph(f"<font color='blue' size=12>{no_item_msg}</font>", sub_style))
     else:
-        # 表の見出し（日本語フォントがある場合は日本語単体、無い場合は英字表記で文字化け防止）
         if is_jp:
             col_headers = ["No", "スズキ品番", "パイオニア品番", "指示数", "枚数", "作業指示", "完了チェック"]
         else:
@@ -144,7 +125,7 @@ def create_instruction_pdf(items, date_val):
                 Paragraph(check_text, cell_style)
             ])
 
-        t = Table(table_data, colWidths=[25, 130, 120, 55, 50, 95, 55])
+        t = Table(table_data, colWidths=[25, 125, 125, 55, 55, 95, 75])
         t.setStyle(TableStyle([
             ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor("#F2F2F2")),
             ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
