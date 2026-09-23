@@ -28,26 +28,34 @@ st.set_page_config(page_title="ピッキングリスト自動解析＆シール�
 st.title("📦 パイオニアラベル貼付 作業指示解析ツール")
 st.write("ピッキングリスト（PDF / 画像）を読み込み、**「作業時間記録Excel」** と **「現場用 印刷指示シート(PDF)」** を自動生成します。")
 
-# --- 日本語フォント（IPAexゴシック）の準備・登録 ---
-FONT_NAME = "IPAexGothic"
-FONT_PATH = "ipaexg.ttf"
+# --- 日本語フォントの安全な読み込み設定 ---
+FONT_NAME = "Helvetica" # デフォルトフォント
 
-def setup_japanese_font():
-    if FONT_NAME not in pdfmetrics.getRegisteredFontNames():
-        if not os.path.exists(FONT_PATH):
-            # IPAexゴシックフォントを公式Webから自動ダウンロード
-            url = "https://github.com/google/fonts/raw/main/ofl/ipaexgothic/IPAexGothic.ttf"
-            try:
-                urllib.request.urlretrieve(url, FONT_PATH)
-            except Exception as e:
-                # フォールバック用リンク
-                url_backup = "https://zipcloud.ibsnet.co.jp/fonts/ipaexg.ttf"
-                urllib.request.urlretrieve(url_backup, FONT_PATH)
-        pdfmetrics.registerFont(TTFont(FONT_NAME, FONT_PATH))
+def init_pdf_font():
+    global FONT_NAME
+    # 外部ダウンロードでエラーが出ないようヘッダー付きで取得を試みる
+    target_font_path = "ipaexg.ttf"
+    if not os.path.exists(target_font_path):
+        try:
+            req = urllib.request.Request(
+                "https://raw.githubusercontent.com/google/fonts/main/ofl/ipaexgothic/IPAexGothic.ttf",
+                headers={'User-Agent': 'Mozilla/5.0'}
+            )
+            with urllib.request.urlopen(req, timeout=5) as response, open(target_font_path, 'wb') as out_file:
+                out_file.write(response.read())
+        except Exception:
+            pass
 
-setup_japanese_font()
+    if os.path.exists(target_font_path):
+        try:
+            pdfmetrics.registerFont(TTFont("IPAexGothic", target_font_path))
+            FONT_NAME = "IPAexGothic"
+        except Exception:
+            FONT_NAME = "Helvetica"
 
-# --- OCRモデルのキャッシュ化（メモリ節約のため英語指定） ---
+init_pdf_font()
+
+# --- OCRモデルのキャッシュ化 ---
 @st.cache_resource
 def load_ocr_reader():
     return easyocr.Reader(['en'], gpu=False)
@@ -84,7 +92,7 @@ def clean_str(s):
     s = re.sub(r'[^A-Z0-9]', '', s)
     return s.replace('O', '0').replace('I', '1').replace('Z', '2')
 
-# --- 印刷用PDF生成関数（日本語フォント完全対応版） ---
+# --- 印刷用PDF生成関数 ---
 def create_instruction_pdf(items, date_val):
     buffer = io.BytesIO()
     doc = SimpleDocTemplate(
@@ -93,42 +101,50 @@ def create_instruction_pdf(items, date_val):
     elements = []
     styles = getSampleStyleSheet()
 
-    # 日本語フォントを指定したスタイル定義
-    title_style = ParagraphStyle('TitleJP', parent=styles['Heading1'], fontName=FONT_NAME, fontSize=16, leading=20, alignment=1)
-    sub_style = ParagraphStyle('SubJP', parent=styles['Normal'], fontName=FONT_NAME, fontSize=10, leading=14, alignment=1)
-    cell_style = ParagraphStyle('CellJP', parent=styles['Normal'], fontName=FONT_NAME, fontSize=9, leading=12)
-    cell_bold = ParagraphStyle('CellBoldJP', parent=styles['Normal'], fontName=FONT_NAME, fontSize=10, leading=13)
+    # フォント切り替え対応スタイル
+    is_jp = (FONT_NAME == "IPAexGothic")
 
-    elements.append(Paragraph("<b>【作業指示書】 パイオニアラベル貼付作業</b>", title_style))
+    title_text = "<b>【作業指示書】 パイオニアラベル貼付作業</b>" if is_jp else "<b>[ WORK INSTRUCTION ] Pioneer Label Attachment</b>"
+    sub_text = f"指示日 (Date): <b>{date_val if date_val else 'N/A'}</b> &nbsp;&nbsp;|&nbsp;&nbsp; 発行日時: {datetime.now().strftime('%Y/%m/%d %H:%M')}"
+    
+    title_style = ParagraphStyle('TitlePDF', parent=styles['Heading1'], fontName=FONT_NAME, fontSize=16, leading=20, alignment=1)
+    sub_style = ParagraphStyle('SubPDF', parent=styles['Normal'], fontName=FONT_NAME, fontSize=10, leading=14, alignment=1)
+    cell_style = ParagraphStyle('CellPDF', parent=styles['Normal'], fontName=FONT_NAME, fontSize=9, leading=12)
+    cell_bold = ParagraphStyle('CellBoldPDF', parent=styles['Normal'], fontName=FONT_NAME, fontSize=10, leading=13)
+
+    elements.append(Paragraph(title_text, title_style))
     elements.append(Spacer(1, 8))
-    elements.append(Paragraph(f"指示日: <b>{date_val if date_val else '未特定'}</b> &nbsp;&nbsp;|&nbsp;&nbsp; 発行日時: {datetime.now().strftime('%Y/%m/%d %H:%M')}", sub_style))
+    elements.append(Paragraph(sub_text, sub_style))
     elements.append(Spacer(1, 12))
 
     if not items:
-        elements.append(Paragraph("<font color='blue' size=12><b>本日、パイオニアラベル貼付の対象品番はありません。</b></font>", sub_style))
+        no_item_msg = "<b>本日、パイオニアラベル貼付の対象品番はありません。</b>" if is_jp else "<b>No target items today.</b>"
+        elements.append(Paragraph(f"<font color='blue' size=12>{no_item_msg}</font>", sub_style))
     else:
-        table_data = [[
-            Paragraph("<b>No</b>", cell_bold),
-            Paragraph("<b>スズキ品番</b>", cell_bold),
-            Paragraph("<b>パイオニア品番</b>", cell_bold),
-            Paragraph("<b>指示数</b>", cell_bold),
-            Paragraph("<b>枚数</b>", cell_bold),
-            Paragraph("<b>作業指示</b>", cell_bold),
-            Paragraph("<b>完了チェック</b>", cell_bold)
-        ]]
+        # 表の見出し（日本語フォントがある場合は日本語単体、無い場合は英字表記で文字化け防止）
+        if is_jp:
+            col_headers = ["No", "スズキ品番", "パイオニア品番", "指示数", "枚数", "作業指示", "完了チェック"]
+        else:
+            col_headers = ["No", "Suzuki Part No", "Pioneer Part No", "Qty", "Sheets", "Instruction", "Check"]
+
+        table_data = [[Paragraph(f"<b>{h}</b>", cell_bold) for h in col_headers]]
 
         for idx, item in enumerate(items, 1):
+            inst_text = "<font color='green'><b>【シール貼付】</b></font>" if is_jp else "<font color='green'><b>[ ATTACH LABEL ]</b></font>"
+            check_text = "[  ] 完了" if is_jp else "[  ] OK"
+            unit_text = "個" if is_jp else "pcs"
+
             table_data.append([
                 Paragraph(str(idx), cell_style),
                 Paragraph(f"<b><font size=10>{item['スズキ品番']}</font></b>", cell_style),
                 Paragraph(str(item['パイオ品番']), cell_style),
-                Paragraph(f"<b><font size=11 color='red'>{item['指示数']} 個</font></b>", cell_style),
+                Paragraph(f"<b><font size=11 color='red'>{item['指示数']} {unit_text}</font></b>", cell_style),
                 Paragraph("", cell_style),
-                Paragraph("<font color='green'><b>【シール貼付】</b></font>", cell_bold),
-                Paragraph("[  ] 完了", cell_style)
+                Paragraph(inst_text, cell_bold),
+                Paragraph(check_text, cell_style)
             ])
 
-        t = Table(table_data, colWidths=[25, 125, 125, 55, 55, 95, 75])
+        t = Table(table_data, colWidths=[25, 130, 120, 55, 50, 95, 55])
         t.setStyle(TableStyle([
             ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor("#F2F2F2")),
             ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
