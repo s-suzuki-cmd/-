@@ -1,5 +1,4 @@
 import streamlit as st
-import easyocr
 import cv2
 import openpyxl
 from openpyxl.styles import Font, Alignment, Border, Side, PatternFill
@@ -55,28 +54,15 @@ def clean_str(s):
     s = re.sub(r'[^A-Z0-9]', '', s)
     return s.replace('O', '0').replace('I', '1').replace('Z', '2')
 
-@st.cache_resource
-def load_ocr_reader():
-    return easyocr.Reader(['ja', 'en'])
-
-reader = load_ocr_reader()
-
-# --- クラッシュ回避版 印刷用PDF生成関数 ---
+# --- 印刷用PDF生成関数 ---
 def create_instruction_pdf(items, date_val):
     buffer = io.BytesIO()
     doc = SimpleDocTemplate(
-        buffer,
-        pagesize=A4,
-        rightMargin=20,
-        leftMargin=20,
-        topMargin=25,
-        bottomMargin=25
+        buffer, pagesize=A4, rightMargin=20, leftMargin=20, topMargin=25, bottomMargin=25
     )
-    
     elements = []
     styles = getSampleStyleSheet()
 
-    # 標準フォントで崩れないスタイル設定
     title_style = ParagraphStyle('TitleJP', parent=styles['Heading1'], fontSize=18, leading=22, alignment=1)
     sub_style = ParagraphStyle('SubJP', parent=styles['Normal'], fontSize=10, leading=14, alignment=1)
     cell_style = ParagraphStyle('CellJP', parent=styles['Normal'], fontSize=9, leading=12)
@@ -224,78 +210,35 @@ if uploaded_file is not None:
         st.session_state.parsed_date = ""
 
     file_bytes = uploaded_file.read()
-    images_to_process = []
 
     if uploaded_file.name.lower().endswith(".pdf"):
         pdf = pdfium.PdfDocument(file_bytes)
+        text_content = ""
         for page in pdf:
-            pil_image = page.render(scale=300/72).to_pil()
-            img_np = np.array(pil_image)
-            images_to_process.append(cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR))
-        st.image(images_to_process[0], caption="ピッキングリスト（1ページ目）", width=400)
-    else:
-        nparr = np.frombuffer(file_bytes, np.uint8)
-        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-        images_to_process.append(img)
-        st.image(images_to_process[0], caption="アップロード画像", width=400)
+            text_page = page.get_textpage()
+            text_content += text_page.get_text_range() + "\n"
+        
+        st.success("PDFテキストをダイレクト読み込みしました！")
 
-    if st.button("🚀 解析して指示書を作成", type="primary"):
-        with st.spinner("ピッキングリストを判定中..."):
+        if st.button("🚀 解析して指示書を作成", type="primary"):
             items = []
-            date_val = ""
-            clean_targets = {clean_str(k): (k, v) for k, v in TARGET_MASTER.items()}
+            date_match = re.search(r'指示日\s*(\d{2,4}/\d{1,2}/\d{1,2})', text_content) or re.search(r'(\d{2,4}/\d{1,2}/\d{1,2})', text_content)
+            date_val = date_match.group(1) if date_match else ""
 
-            for img in images_to_process:
-                h, w = img.shape[:2]
-                img_large = cv2.resize(img, (w * 2, h * 2), interpolation=cv2.INTER_CUBIC)
-                results = reader.readtext(img_large, detail=1)
-
-                if not date_val:
-                    full_text = "\n".join([r[1] for r in results])
-                    date_match = re.search(r'指示日\s*(\d{2,4}/\d{1,2}/\d{1,2})', full_text) or re.search(r'(\d{2,4}/\d{1,2}/\d{1,2})', full_text)
-                    if date_match:
-                        date_val = date_match.group(1)
-
-                rows_by_y = []
-                for item in results:
-                    bbox, text, prob = item
-                    if prob < 0.1:
-                        continue
-                    y_center = (bbox[0][1] + bbox[2][1]) / 2
-                    x_center = (bbox[0][0] + bbox[1][0]) / 2
-                    
-                    placed = False
-                    for row in rows_by_y:
-                        if abs(row['y'] - y_center) < 35:
-                            row['items'].append({'x': x_center, 'text': text})
-                            placed = True
-                            break
-                    if not placed:
-                        rows_by_y.append({'y': y_center, 'items': [{'x': x_center, 'text': text}]})
-
-                rows_by_y.sort(key=lambda r: r['y'])
-
-                for row in rows_by_y:
-                    row_items = sorted(row['items'], key=lambda x: x['x'])
-                    row_full = " ".join([it['text'] for it in row_items])
-                    c_row = clean_str(row_full)
-                    
-                    matched_target = None
-                    for c_suzuki, (orig_s, orig_p) in clean_targets.items():
-                        if c_suzuki[:7] in c_row or clean_str(orig_p)[:8] in c_row:
-                            matched_target = (orig_s, orig_p)
-                            break
-
-                    if matched_target:
-                        s_code, p_code = matched_target
+            for s_code, p_code in TARGET_MASTER.items():
+                c_s = clean_str(s_code)
+                c_p = clean_str(p_code)
+                
+                lines = text_content.split("\n")
+                for line in lines:
+                    c_line = clean_str(line)
+                    if c_s[:7] in c_line or c_p[:8] in c_line:
                         qty = ""
-                        for it in row_items:
-                            t = it['text'].replace(',', '').strip()
-                            if t.isdigit() and 1 <= int(t) <= 9999:
-                                if int(t) not in [31, 471, 1535, 6100, 34]:
-                                    qty = int(t)
-                                    break
-
+                        nums = re.findall(r'\b\d{1,4}\b', line)
+                        for n in nums:
+                            if int(n) not in [31, 471, 1535, 6100, 34]:
+                                qty = int(n)
+                                break
                         if not any(x["スズキ品番"] == s_code for x in items):
                             items.append({
                                 "指示日": date_val,
@@ -304,11 +247,10 @@ if uploaded_file is not None:
                                 "パイオ品番": p_code
                             })
 
-            # セッション状態に保存
             st.session_state.parsed_items = items
             st.session_state.parsed_date = date_val
 
-    # 解析データが存在する場合（画面を維持）
+    # 解析結果表示
     if "parsed_items" in st.session_state and st.session_state.parsed_items is not None:
         items = st.session_state.parsed_items
         date_val = st.session_state.parsed_date
@@ -336,7 +278,6 @@ if uploaded_file is not None:
 
         st.divider()
 
-        # ファイル生成
         excel_buffer = create_excel(items)
         pdf_buffer = create_instruction_pdf(items, date_val)
 
