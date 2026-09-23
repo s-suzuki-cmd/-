@@ -27,9 +27,7 @@ st.title("📦 パイオニアラベル貼付 作業指示解析ツール")
 st.write("ピッキングリスト（PDF / 画像）を読み込み、**「作業時間記録Excel」** と **「現場用 印刷指示シート(PDF)」** を自動生成します。")
 
 # --- 日本語フォント設定 ---
-FONT_NAME = "Helvetica" # デフォルト
-
-# 同一ディレクトリ内の IPAexGothic.ttf を検索・登録
+FONT_NAME = "Helvetica"
 font_file = "IPAexGothic.ttf"
 if os.path.exists(font_file):
     try:
@@ -43,7 +41,7 @@ if os.path.exists(font_file):
 def load_ocr_reader():
     return easyocr.Reader(['en'], gpu=False)
 
-# --- PDFに基づく対象品番マスター ---
+# --- 対象品番マスター ---
 TARGET_MASTER = {
     "99092-77R23-N02": "AD-1957ZS/JP",
     "99092-84UR5-N01": "AD-1957ZS02/JP",
@@ -56,7 +54,7 @@ TARGET_MASTER = {
     "99000-79Y64-000": "CD-7756ZS-E1",
     "9909J-78RM5-N01": "CD-HM022ZSE1",
     "3A108-65T00-000": "CNMV-0159ZS/EU",
-    "3A108-65T01-000": "CNMV-0159ZS02/EU",
+    "3A108-65T01-000": "CNMV-0259ZS/EU",
     "3A108-65T10-000": "CNMV-0259ZS/AU",
     "3A108-65T11-000": "CNMV-0259ZS02/AU",
     "99093-55ZR3-N03": "KJ-S103DKZSE1",
@@ -74,6 +72,83 @@ def clean_str(s):
     s = str(s).upper()
     s = re.sub(r'[^A-Z0-9]', '', s)
     return s.replace('O', '0').replace('I', '1').replace('Z', '2')
+
+# --- 行ベースで高精度にOCRテキストをブロック解析する関数 ---
+def parse_picking_list_advanced(ocr_results):
+    # OCR結果： [bbox, text, prob]
+    # bbox から Y座標中央値 と X座標左端 を抽出
+    parsed_boxes = []
+    full_text = ""
+    for item in ocr_results:
+        bbox, text, prob = item
+        full_text += " " + text
+        y_center = (bbox[0][1] + bbox[2][1]) / 2.0
+        x_left = bbox[0][0]
+        parsed_boxes.append({
+            'text': text.strip(),
+            'clean': clean_str(text),
+            'y': y_center,
+            'x': x_left,
+            'bbox': bbox
+        })
+
+    # 指示日抽出 (例: 26/09/14)
+    date_match = re.search(r'(\d{2,4}/\d{1,2}/\d{1,2})', full_text)
+    date_val = date_match.group(1) if date_match else ""
+
+    # Y座標が近い要素を「行」としてグループ化 (誤差15px以内)
+    parsed_boxes.sort(key=lambda b: b['y'])
+    rows = []
+    for box in parsed_boxes:
+        placed = False
+        for row in rows:
+            if abs(row['y_mean'] - box['y']) < 15:
+                row['items'].append(box)
+                row['y_mean'] = sum(b['y'] for b in row['items']) / len(row['items'])
+                placed = True
+                break
+        if not placed:
+            rows.append({'y_mean': box['y'], 'items': [box]})
+
+    # 各行の要素を X 座標（左から右）に整列
+    for row in rows:
+        row['items'].sort(key=lambda b: b['x'])
+
+    found_items = []
+
+    # マスター品番ごとに該当行を検索
+    for s_code, p_code in TARGET_MASTER.items():
+        c_s_prefix = clean_str(s_code)[:7] # 前半7文字で照合
+        c_p_prefix = clean_str(p_code)[:6]
+
+        for row in rows:
+            row_items = row['items']
+            # この行にスズキ品番またはパイオニア品番が含まれているかチェック
+            match_index = -1
+            for idx, item in enumerate(row_items):
+                if c_s_prefix in item['clean'] or c_p_prefix in item['clean']:
+                    match_index = idx
+                    break
+
+            if match_index != -1:
+                # 品番が見つかった行から「指示数」を探す
+                # ピッキングリストの構造上、品番の右側（X座標がより大きい要素）にある最初の「純粋な数字」が指示数
+                qty = ""
+                for item in row_items[match_index + 1:]:
+                    text = item['text'].replace(',', '')
+                    if text.isdigit() and 1 <= int(text) <= 9999:
+                        qty = int(text)
+                        break
+
+                if qty != "" and not any(x["スズキ品番"] == s_code for x in found_items):
+                    found_items.append({
+                        "指示日": date_val,
+                        "指示数": qty,
+                        "スズキ品番": s_code,
+                        "パイオ品番": p_code
+                    })
+
+    return found_items, date_val
 
 # --- 印刷用PDF生成関数 ---
 def create_instruction_pdf(items, date_val):
@@ -229,6 +304,7 @@ def create_excel(items):
     excel_buffer.seek(0)
     return excel_buffer
 
+# --- メインUI ---
 uploaded_file = st.file_uploader("ピッキングリスト（PDF / 画像）をアップロードしてください", type=["pdf", "jpg", "jpeg", "png"])
 
 if uploaded_file is not None:
@@ -240,53 +316,23 @@ if uploaded_file is not None:
     file_bytes = uploaded_file.read()
 
     if st.button("🚀 解析して指示書を作成", type="primary"):
-        with st.spinner("🔍 画像から文字を解析中（OCR処理）..."):
+        with st.spinner("🔍 画像から文字と位置を解析中（高精度OCR処理）..."):
             reader = load_ocr_reader()
-            all_text_results = []
+            ocr_results = []
 
             if uploaded_file.name.lower().endswith(".pdf"):
                 pdf = pdfium.PdfDocument(file_bytes)
                 for page in pdf:
                     image = page.render(scale=2).to_pil()
                     img_np = np.array(image)
-                    ocr_res = reader.readtext(img_np, detail=0)
-                    all_text_results.extend(ocr_res)
+                    res = reader.readtext(img_np, detail=1)
+                    ocr_results.extend(res)
             else:
                 img = cv2.imdecode(np.frombuffer(file_bytes, np.uint8), cv2.IMREAD_COLOR)
-                ocr_res = reader.readtext(img, detail=0)
-                all_text_results.extend(ocr_res)
+                res = reader.readtext(img, detail=1)
+                ocr_results.extend(res)
 
-            full_text = " ".join(all_text_results)
-
-            items = []
-            date_match = re.search(r'(\d{2,4}/\d{1,2}/\d{1,2})', full_text)
-            date_val = date_match.group(1) if date_match else ""
-
-            for s_code, p_code in TARGET_MASTER.items():
-                c_s = clean_str(s_code)
-                c_p = clean_str(p_code)
-
-                for idx, text in enumerate(all_text_results):
-                    c_text = clean_str(text)
-                    if c_s[:7] in c_text or c_p[:8] in c_text:
-                        qty = ""
-                        search_range = all_text_results[max(0, idx-3):min(len(all_text_results), idx+4)]
-                        for near_text in search_range:
-                            nums = re.findall(r'\b\d{1,4}\b', near_text)
-                            for n in nums:
-                                if int(n) not in [31, 471, 1535, 6100, 34]:
-                                    qty = int(n)
-                                    break
-                            if qty:
-                                break
-
-                        if not any(x["スズキ品番"] == s_code for x in items):
-                            items.append({
-                                "指示日": date_val,
-                                "指示数": qty,
-                                "スズキ品番": s_code,
-                                "パイオ品番": p_code
-                            })
+            items, date_val = parse_picking_list_advanced(ocr_results)
 
             st.session_state.parsed_items = items
             st.session_state.parsed_date = date_val
