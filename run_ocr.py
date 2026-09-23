@@ -41,7 +41,7 @@ if os.path.exists(font_file):
 def load_ocr_reader():
     return easyocr.Reader(['en'], gpu=False)
 
-# --- 対象品番マスター ---
+# --- 対象品番マスター（ハイフン除去版キーとのマッピング） ---
 TARGET_MASTER = {
     "99092-77R23-N02": "AD-1957ZS/JP",
     "99092-84UR5-N01": "AD-1957ZS02/JP",
@@ -68,15 +68,21 @@ TARGET_MASTER = {
     "9909N-80TY4-N01": "UD-1377ZSE6/WL"
 }
 
-def clean_str(s):
+def clean_code(s):
+    """記号を取り除き英大文字数字のみにする（O->0, I->1置換含む）"""
     s = str(s).upper()
     s = re.sub(r'[^A-Z0-9]', '', s)
     return s.replace('O', '0').replace('I', '1').replace('Z', '2')
 
-# --- 行ベースで高精度にOCRテキストをブロック解析する関数 ---
-def parse_picking_list_advanced(ocr_results):
-    # OCR結果： [bbox, text, prob]
-    # bbox から Y座標中央値 と X座標左端 を抽出
+# マスターの比較用辞書を作成
+CLEAN_MASTER = {}
+for s_code, p_code in TARGET_MASTER.items():
+    s_clean = clean_code(s_code)
+    p_clean = clean_code(p_code)
+    CLEAN_MASTER[s_clean] = (s_code, p_code)
+    CLEAN_MASTER[p_clean] = (s_code, p_code)
+
+def parse_picking_list_strict(ocr_results):
     parsed_boxes = []
     full_text = ""
     for item in ocr_results:
@@ -86,23 +92,22 @@ def parse_picking_list_advanced(ocr_results):
         x_left = bbox[0][0]
         parsed_boxes.append({
             'text': text.strip(),
-            'clean': clean_str(text),
+            'clean': clean_code(text),
             'y': y_center,
-            'x': x_left,
-            'bbox': bbox
+            'x': x_left
         })
 
     # 指示日抽出 (例: 26/09/14)
     date_match = re.search(r'(\d{2,4}/\d{1,2}/\d{1,2})', full_text)
     date_val = date_match.group(1) if date_match else ""
 
-    # Y座標が近い要素を「行」としてグループ化 (誤差15px以内)
+    # Y座標（高さ）ごとにグループ化 (行の判定: 誤差20px)
     parsed_boxes.sort(key=lambda b: b['y'])
     rows = []
     for box in parsed_boxes:
         placed = False
         for row in rows:
-            if abs(row['y_mean'] - box['y']) < 15:
+            if abs(row['y_mean'] - box['y']) < 20:
                 row['items'].append(box)
                 row['y_mean'] = sum(b['y'] for b in row['items']) / len(row['items'])
                 placed = True
@@ -110,43 +115,48 @@ def parse_picking_list_advanced(ocr_results):
         if not placed:
             rows.append({'y_mean': box['y'], 'items': [box]})
 
-    # 各行の要素を X 座標（左から右）に整列
-    for row in rows:
-        row['items'].sort(key=lambda b: b['x'])
-
     found_items = []
 
-    # マスター品番ごとに該当行を検索
-    for s_code, p_code in TARGET_MASTER.items():
-        c_s_prefix = clean_str(s_code)[:7] # 前半7文字で照合
-        c_p_prefix = clean_str(p_code)[:6]
+    # 各行ごとに「原本にマスター品番が存在するか」を厳密にチェック
+    for row in rows:
+        row_items = sorted(row['items'], key=lambda b: b['x']) # X座標左から順
+        
+        hit_master = None
+        hit_idx = -1
 
-        for row in rows:
-            row_items = row['items']
-            # この行にスズキ品番またはパイオニア品番が含まれているかチェック
-            match_index = -1
-            for idx, item in enumerate(row_items):
-                if c_s_prefix in item['clean'] or c_p_prefix in item['clean']:
-                    match_index = idx
+        for idx, item in enumerate(row_items):
+            c_text = item['clean']
+            if len(c_text) < 5:
+                continue
+            
+            # 原本上の文字がマスターに含まれるか判定
+            for m_clean, (s_orig, p_orig) in CLEAN_MASTER.items():
+                if m_clean in c_text or c_text in m_clean:
+                    hit_master = (s_orig, p_orig)
+                    hit_idx = idx
                     break
+            if hit_master:
+                break
 
-            if match_index != -1:
-                # 品番が見つかった行から「指示数」を探す
-                # ピッキングリストの構造上、品番の右側（X座標がより大きい要素）にある最初の「純粋な数字」が指示数
-                qty = ""
-                for item in row_items[match_index + 1:]:
-                    text = item['text'].replace(',', '')
-                    if text.isdigit() and 1 <= int(text) <= 9999:
-                        qty = int(text)
-                        break
-
-                if qty != "" and not any(x["スズキ品番"] == s_code for x in found_items):
-                    found_items.append({
-                        "指示日": date_val,
-                        "指示数": qty,
-                        "スズキ品番": s_code,
-                        "パイオ品番": p_code
-                    })
+        if hit_master:
+            s_code, p_code = hit_master
+            qty = ""
+            
+            # 品番の右側にある数値（指示数）を取得
+            for item in row_items[hit_idx + 1:]:
+                txt = item['text'].replace(',', '').replace(' ', '')
+                if txt.isdigit() and 1 <= int(txt) <= 9999:
+                    qty = int(txt)
+                    break
+            
+            # すでに登録済みでなければ追加
+            if qty != "" and not any(x["スズキ品番"] == s_code for x in found_items):
+                found_items.append({
+                    "指示日": date_val,
+                    "指示数": qty,
+                    "スズキ品番": s_code,
+                    "パイオ品番": p_code
+                })
 
     return found_items, date_val
 
@@ -316,7 +326,7 @@ if uploaded_file is not None:
     file_bytes = uploaded_file.read()
 
     if st.button("🚀 解析して指示書を作成", type="primary"):
-        with st.spinner("🔍 画像から文字と位置を解析中（高精度OCR処理）..."):
+        with st.spinner("🔍 画像から文字と位置を解析中（厳密照合OCR処理）..."):
             reader = load_ocr_reader()
             ocr_results = []
 
@@ -332,7 +342,7 @@ if uploaded_file is not None:
                 res = reader.readtext(img, detail=1)
                 ocr_results.extend(res)
 
-            items, date_val = parse_picking_list_advanced(ocr_results)
+            items, date_val = parse_picking_list_strict(ocr_results)
 
             st.session_state.parsed_items = items
             st.session_state.parsed_date = date_val
