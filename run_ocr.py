@@ -16,7 +16,6 @@ from reportlab.lib.pagesizes import A4
 from reportlab.lib import colors
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.pdfgen import canvas
 
 # ページの基本設定
 st.set_page_config(page_title="ピッキングリスト自動解析＆シール指示ツール", layout="wide")
@@ -61,29 +60,7 @@ def clean_str(s):
     s = re.sub(r'[^A-Z0-9]', '', s)
     return s.replace('O', '0').replace('I', '1').replace('Z', '2')
 
-# --- 日本語フォント対応キャンバス ---
-class NumberedCanvas(canvas.Canvas):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self._saved_page_states = []
-
-    def showPage(self):
-        self._saved_page_states.append(dict(self.__dict__))
-        self._startPage()
-
-    def save(self):
-        num_pages = len(self._saved_page_states)
-        for state in self._saved_page_states:
-            self.__dict__.update(state)
-            self.draw_page_number(num_pages)
-            canvas.Canvas.showPage(self)
-        canvas.Canvas.save(self)
-
-    def draw_page_number(self, page_count):
-        self.setFont("Helvetica", 9)
-        self.drawRightString(200 * 2.835 - 20, 15, f"Page {self._pageNumber} of {page_count}")
-
-# --- 印刷用PDF生成関数（日本語表記版） ---
+# --- 印刷用PDF生成関数（文字化け防止・標準フォント版） ---
 def create_instruction_pdf(items, date_val):
     buffer = io.BytesIO()
     doc = SimpleDocTemplate(
@@ -92,27 +69,27 @@ def create_instruction_pdf(items, date_val):
     elements = []
     styles = getSampleStyleSheet()
 
-    title_style = ParagraphStyle('TitleJP', parent=styles['Heading1'], fontSize=18, leading=22, alignment=1)
-    sub_style = ParagraphStyle('SubJP', parent=styles['Normal'], fontSize=10, leading=14, alignment=1)
-    cell_style = ParagraphStyle('CellJP', parent=styles['Normal'], fontSize=9, leading=12)
-    cell_bold = ParagraphStyle('CellBoldJP', parent=styles['Normal'], fontSize=10, leading=13)
+    title_style = ParagraphStyle('TitleStandard', parent=styles['Heading1'], fontSize=16, leading=20, alignment=1)
+    sub_style = ParagraphStyle('SubStandard', parent=styles['Normal'], fontSize=10, leading=14, alignment=1)
+    cell_style = ParagraphStyle('CellStandard', parent=styles['Normal'], fontSize=9, leading=12)
+    cell_bold = ParagraphStyle('CellBoldStandard', parent=styles['Normal'], fontSize=10, leading=13)
 
-    elements.append(Paragraph("<b>【作業指示書】 パイオニアラベル貼付作業</b>", title_style))
+    elements.append(Paragraph("<b>[ WORK INSTRUCTION ] Pioneer Label Attachment</b>", title_style))
     elements.append(Spacer(1, 8))
-    elements.append(Paragraph(f"指示日: <b>{date_val if date_val else '未特定'}</b> &nbsp;&nbsp;|&nbsp;&nbsp; 発行日時: {datetime.now().strftime('%Y/%m/%d %H:%M')}", sub_style))
+    elements.append(Paragraph(f"Sh指示日 (Date): <b>{date_val if date_val else 'N/A'}</b> &nbsp;&nbsp;|&nbsp;&nbsp; Issued: {datetime.now().strftime('%Y/%m/%d %H:%M')}", sub_style))
     elements.append(Spacer(1, 12))
 
     if not items:
-        elements.append(Paragraph("<font color='blue' size=12><b>本日、パイオニアラベル貼付の対象品番はありません。</b></font>", sub_style))
+        elements.append(Paragraph("<font color='blue' size=12><b>No target items for label attachment today. (作業対象なし)</b></font>", sub_style))
     else:
         table_data = [[
             Paragraph("<b>No</b>", cell_bold),
-            Paragraph("<b>スズキ品番</b>", cell_bold),
-            Paragraph("<b>パイオニア品番</b>", cell_bold),
-            Paragraph("<b>指示数</b>", cell_bold),
-            Paragraph("<b>枚数</b>", cell_bold),
-            Paragraph("<b>作業指示</b>", cell_bold),
-            Paragraph("<b>完了チェック</b>", cell_bold)
+            Paragraph("<b>Suzuki Part No (スズキ品番)</b>", cell_bold),
+            Paragraph("<b>Pioneer Part No (パイオ品番)</b>", cell_bold),
+            Paragraph("<b>Qty (指示数)</b>", cell_bold),
+            Paragraph("<b>Sheets (枚数)</b>", cell_bold),
+            Paragraph("<b>Instruction (作業内容)</b>", cell_bold),
+            Paragraph("<b>Check (完了)</b>", cell_bold)
         ]]
 
         for idx, item in enumerate(items, 1):
@@ -120,13 +97,13 @@ def create_instruction_pdf(items, date_val):
                 Paragraph(str(idx), cell_style),
                 Paragraph(f"<b><font size=10>{item['スズキ品番']}</font></b>", cell_style),
                 Paragraph(str(item['パイオ品番']), cell_style),
-                Paragraph(f"<b><font size=11 color='red'>{item['指示数']} 個</font></b>", cell_style),
+                Paragraph(f"<b><font size=11 color='red'>{item['指示数']} pcs</font></b>", cell_style),
                 Paragraph("", cell_style),
-                Paragraph("<font color='green'><b>【シール貼付】</b></font>", cell_bold),
-                Paragraph("[  ] 完了", cell_style)
+                Paragraph("<font color='green'><b>[ ATTACH LABEL ]<br/>シール貼付</b></font>", cell_bold),
+                Paragraph("[  ] OK", cell_style)
             ])
 
-        t = Table(table_data, colWidths=[25, 125, 125, 55, 55, 95, 75])
+        t = Table(table_data, colWidths=[25, 130, 120, 55, 50, 95, 55])
         t.setStyle(TableStyle([
             ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor("#F2F2F2")),
             ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
