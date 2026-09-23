@@ -26,12 +26,12 @@ st.set_page_config(page_title="ピッキングリスト自動解析＆シール�
 st.title("📦 パイオニアラベル貼付 作業指示解析ツール")
 st.write("ピッキングリスト（PDF / 画像）を読み込み、**「作業時間記録Excel」** と **「現場用 印刷指示シート(PDF)」** を自動生成します。")
 
-# --- 日本語標準フォントの強制登録 ---
+# --- 日本語標準フォントの登録 ---
 FONT_NAME = "HeiseiKakuGo-W5"
 try:
     pdfmetrics.registerFont(UnicodeCIDFont("HeiseiKakuGo-W5"))
 except Exception:
-    FONT_NAME = "Helvetica" # フォールバック
+    FONT_NAME = "Helvetica"
 
 # --- OCRモデルのキャッシュ化 ---
 @st.cache_resource
@@ -139,7 +139,8 @@ def parse_picking_list_strict(ocr_results):
                     qty = int(txt)
                     break
             
-            if qty != "" and not any(x["スズキ品番"] == s_code for x in found_items):
+            # 合算せず、そのまま件数として追加
+            if qty != "":
                 found_items.append({
                     "指示日": date_val,
                     "指示数": qty,
@@ -238,7 +239,7 @@ def create_excel(items):
         cell.fill = fill_header
         cell.border = border_cell
 
-    max_rows = 18
+    max_rows = max(18, len(items))
     for row_idx in range(1, max_rows + 1):
         r = row_idx + 3
         c0 = ws.cell(row=r, column=1, value=row_idx)
@@ -282,11 +283,11 @@ def create_excel(items):
     dv_people = DataValidation(type="list", formula1="=$AB$1:$AB$10", allow_blank=True)
 
     ws.add_data_validation(dv_date)
-    dv_date.add("B4:B21")
+    dv_date.add(f"B4:B{max_rows + 3}")
     ws.add_data_validation(dv_time)
-    dv_time.add("G4:H21")
+    dv_time.add(f"G4:H{max_rows + 3}")
     ws.add_data_validation(dv_people)
-    dv_people.add("J4:J21")
+    dv_people.add(f"J4:J{max_rows + 3}")
 
     column_widths = {"A": 5, "B": 14, "C": 12, "D": 10, "E": 20, "F": 22, "G": 12, "H": 12, "I": 14, "J": 10}
     for col_letter, width in column_widths.items():
@@ -298,37 +299,38 @@ def create_excel(items):
     return excel_buffer
 
 # --- メインUI ---
-uploaded_file = st.file_uploader("ピッキングリスト（PDF / 画像）をアップロードしてください", type=["pdf", "jpg", "jpeg", "png"])
+uploaded_files = st.file_uploader("ピッキングリスト（PDF / 画像）をアップロードしてください（複数選択可）", type=["pdf", "jpg", "jpeg", "png"], accept_multiple_files=True)
 
-if uploaded_file is not None:
-    if "file_name" not in st.session_state or st.session_state.file_name != uploaded_file.name:
-        st.session_state.file_name = uploaded_file.name
-        st.session_state.parsed_items = None
-        st.session_state.parsed_date = ""
-
-    file_bytes = uploaded_file.read()
-
+if uploaded_files:
     if st.button("🚀 解析して指示書を作成", type="primary"):
-        with st.spinner("🔍 画像から文字と位置を解析中（日本語指示書作成中）..."):
+        with st.spinner("🔍 ファイルを順次解析中..."):
             reader = load_ocr_reader()
-            ocr_results = []
+            all_items = []
+            latest_date = ""
 
-            if uploaded_file.name.lower().endswith(".pdf"):
-                pdf = pdfium.PdfDocument(file_bytes)
-                for page in pdf:
-                    image = page.render(scale=2).to_pil()
-                    img_np = np.array(image)
-                    res = reader.readtext(img_np, detail=1)
+            for file in uploaded_files:
+                file_bytes = file.read()
+                ocr_results = []
+
+                if file.name.lower().endswith(".pdf"):
+                    pdf = pdfium.PdfDocument(file_bytes)
+                    for page in pdf:
+                        image = page.render(scale=2).to_pil()
+                        img_np = np.array(image)
+                        res = reader.readtext(img_np, detail=1)
+                        ocr_results.extend(res)
+                else:
+                    img = cv2.imdecode(np.frombuffer(file_bytes, np.uint8), cv2.IMREAD_COLOR)
+                    res = reader.readtext(img, detail=1)
                     ocr_results.extend(res)
-            else:
-                img = cv2.imdecode(np.frombuffer(file_bytes, np.uint8), cv2.IMREAD_COLOR)
-                res = reader.readtext(img, detail=1)
-                ocr_results.extend(res)
 
-            items, date_val = parse_picking_list_strict(ocr_results)
+                items, date_val = parse_picking_list_strict(ocr_results)
+                all_items.extend(items)
+                if date_val:
+                    latest_date = date_val
 
-            st.session_state.parsed_items = items
-            st.session_state.parsed_date = date_val
+            st.session_state.parsed_items = all_items
+            st.session_state.parsed_date = latest_date
 
     # 解析結果表示
     if "parsed_items" in st.session_state and st.session_state.parsed_items is not None:
@@ -347,14 +349,14 @@ if uploaded_file is not None:
                 with col:
                     st.markdown(f"""
                     <div style="background-color: #E8F5E9; padding: 15px; border-radius: 10px; border-left: 8px solid #2E7D32; margin-bottom: 12px;">
-                        <span style="background-color: #2E7D32; color: white; padding: 3px 8px; border-radius: 5px; font-weight: bold; font-size: 14px;">🏷️ シール貼付あり</span>
+                        <span style="background-color: #2E7D32; color: white; padding: 3px 8px; border-radius: 5px; font-weight: bold; font-size: 14px;">🏷️ シール貼付あり (No.{idx+1})</span>
                         <h3 style="margin: 8px 0 4px 0; color: #1B5E20;">{item['スズキ品番']}</h3>
                         <p style="margin: 0; font-weight: bold; color: #333;">パイオ品番: {item['パイオ品番']}</p>
                         <p style="margin: 0; font-size: 18px; font-weight: bold; color: #C62828;">指示数量: {item['指示数']} 個</p>
                     </div>
                     """, unsafe_allow_html=True)
         else:
-            st.success("✅ **【シール貼付 不要】** 本日のピッキングリストには対象品番が含まれていません（作業なし）。")
+            st.success("✅ **【シール貼付 不要】** 対象品番が含まれていません（作業なし）。")
 
         st.divider()
 
