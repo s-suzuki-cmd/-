@@ -21,26 +21,10 @@ from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.cidfonts import UnicodeCIDFont
 
-# ページの基本設定
 st.set_page_config(page_title="ピッキングリスト自動解析＆シール指示ツール", layout="wide")
 
-st.title("📦 パイオニアラベル貼付 作業指示解析ツール")
-st.write("ピッキングリスト（PDF / 画像）を読み込み、**「作業時間記録Excel」** と **「現場用 印刷指示シート(PDF)」** を自動生成します。")
-
-# --- 日本語標準フォントの登録 ---
-FONT_NAME = "HeiseiKakuGo-W5"
-try:
-    pdfmetrics.registerFont(UnicodeCIDFont("HeiseiKakuGo-W5"))
-except Exception:
-    FONT_NAME = "Helvetica"
-
-# --- OCRモデルのキャッシュ化 ---
-@st.cache_resource
-def load_ocr_reader():
-    return easyocr.Reader(['en'], gpu=False)
-
-# --- 対象品番マスター ---
-TARGET_MASTER = {
+# 対象品番マスター
+DEFAULT_MASTER = {
     "99092-77R23-N02": "AD-1957ZS/JP",
     "99092-84UR5-N01": "AD-1957ZS02/JP",
     "99000-79BP3-000": "AN-1327ZS",
@@ -50,7 +34,7 @@ TARGET_MASTER = {
     "99000-79Y27-PF1": "AN-ZH09ZS-71A",
     "99000-79BP4-000": "CD-1317ZS",
     "99000-79Y64-000": "CD-7756ZS-E1",
-    "99000-79X94-000": "CD-VRM200ZS-E1",  # ← 新規追加
+    "99000-79X94-000": "CD-VRM200ZS-E1",
     "9909J-78RM5-N01": "CD-HM022ZSE1",
     "3A108-65T00-000": "CNMV-0159ZS/EU",
     "3A108-65T01-000": "CNMV-0259ZS/EU",
@@ -67,58 +51,75 @@ TARGET_MASTER = {
     "9909N-80TY4-N01": "UD-1377ZSE6/WL"
 }
 
+st.sidebar.header("⚙️ マスター設定")
+if "target_master" not in st.session_state:
+    st.session_state.target_master = DEFAULT_MASTER
+
+with st.sidebar.expander("➕ 新規品番の追加", expanded=False):
+    new_s = st.text_input("スズキ品番 (例: 99000-79X94-000)")
+    new_p = st.text_input("パイオニア品番 (例: CD-VRM200ZS-E1)")
+    if st.button("追加登録"):
+        if new_s and new_p:
+            st.session_state.target_master[new_s.strip()] = new_p.strip()
+            st.success(f"登録しました: {new_s} -> {new_p}")
+        else:
+            st.warning("両方の品番を入力してください")
+
+FONT_NAME = "HeiseiKakuGo-W5"
+try:
+    pdfmetrics.registerFont(UnicodeCIDFont("HeiseiKakuGo-W5"))
+except Exception:
+    FONT_NAME = "Helvetica"
+
+@st.cache_resource
+def load_ocr_reader():
+    return easyocr.Reader(['en'], gpu=False)
+
 def clean_code(s):
     s = str(s).upper()
     s = re.sub(r'[^A-Z0-9]', '', s)
     s = s.replace('O', '0').replace('I', '1').replace('Z', '2').replace('S', '5')
     return s
 
-def get_base_code(s):
-    c = clean_code(s)
-    return c[:10] if len(c) >= 10 else c
+def build_clean_master(master_dict):
+    clean_list = []
+    for s_code, p_code in master_dict.items():
+        clean_list.append({
+            's_orig': s_code,
+            'p_orig': p_code,
+            's_clean': clean_code(s_code),
+            'p_clean': clean_code(p_code)
+        })
+    return clean_list
 
-CLEAN_MASTER = []
-for s_code, p_code in TARGET_MASTER.items():
-    s_clean = clean_code(s_code)
-    p_clean = clean_code(p_code)
-    s_base = get_base_code(s_code)
-    p_base = get_base_code(p_code)
-    
-    CLEAN_MASTER.append({
-        's_orig': s_code,
-        'p_orig': p_code,
-        's_clean': s_clean,
-        'p_clean': p_clean,
-        's_base': s_base,
-        'p_base': p_base
-    })
-
-def match_master(text):
+def match_master(text, clean_master):
+    """厳密さを維持したマスター照合ロジック"""
     c_text = clean_code(text)
-    base_text = get_base_code(text)
 
     if len(c_text) < 5:
         return None
 
-    for m in CLEAN_MASTER:
-        if (m['s_clean'] in c_text or c_text in m['s_clean'] or 
-            m['p_clean'] in c_text or c_text in m['p_clean']):
+    # XIJPなどの非対象仕様が含まれる場合は除外
+    if "XIJP" in c_text or "XI" in text.upper():
+        return None
+
+    for m in clean_master:
+        # スズキ品番またはパイオニア品番との高精度マッチング
+        if m['s_clean'] in c_text or c_text in m['s_clean']:
+            return (m['s_orig'], m['p_orig'])
+        if m['p_clean'] in c_text or c_text in m['p_clean']:
             return (m['s_orig'], m['p_orig'])
 
-    for m in CLEAN_MASTER:
-        if (m['s_base'] in base_text or base_text in m['s_base'] or
-            m['p_base'] in base_text or base_text in m['p_base']):
-            return (m['s_orig'], m['p_orig'])
-
-    for m in CLEAN_MASTER:
+    # 類似度判定（1文字違いレベルのみ許容）
+    for m in clean_master:
         ratio_s = SequenceMatcher(None, m['s_clean'], c_text).ratio()
         ratio_p = SequenceMatcher(None, m['p_clean'], c_text).ratio()
-        if ratio_s > 0.82 or ratio_p > 0.82:
+        if ratio_s > 0.88 or ratio_p > 0.88:
             return (m['s_orig'], m['p_orig'])
 
     return None
 
-def parse_single_page(ocr_results):
+def parse_single_page(ocr_results, clean_master):
     parsed_boxes = []
     full_text = ""
     for item in ocr_results:
@@ -150,6 +151,7 @@ def parse_single_page(ocr_results):
             rows.append({'y_mean': box['y'], 'items': [box]})
 
     page_items = []
+    suspicious_codes = []
 
     for row in rows:
         row_items = sorted(row['items'], key=lambda b: b['x'])
@@ -159,7 +161,7 @@ def parse_single_page(ocr_results):
         hit_x = 0
 
         for idx, item in enumerate(row_items):
-            hit = match_master(item['text'])
+            hit = match_master(item['text'], clean_master)
             if hit:
                 hit_master = hit
                 hit_idx = idx
@@ -187,9 +189,8 @@ def parse_single_page(ocr_results):
                     "パイオ品番": p_code
                 })
 
-    return page_items, date_val
+    return page_items, date_val, suspicious_codes
 
-# --- 印刷用日本語PDF生成関数 ---
 def create_instruction_pdf(items, date_val):
     buffer = io.BytesIO()
     doc = SimpleDocTemplate(
@@ -248,7 +249,6 @@ def create_instruction_pdf(items, date_val):
     buffer.seek(0)
     return buffer
 
-# --- Excel生成関数 ---
 def create_excel(items):
     wb = openpyxl.Workbook()
     ws = wb.active
@@ -338,12 +338,16 @@ def create_excel(items):
     return excel_buffer
 
 # --- メインUI ---
+st.title("📦 パイオニアラベル貼付 作業指示解析ツール")
+st.write("ピッキングリスト（PDF / 画像）を読み込み、**「作業時間記録Excel」** と **「現場用 印刷指示シート(PDF)」** を自動生成します。")
+
 uploaded_files = st.file_uploader("ピッキングリスト（PDF / 画像）をアップロードしてください（複数選択可）", type=["pdf", "jpg", "jpeg", "png"], accept_multiple_files=True)
 
 if uploaded_files:
     if st.button("🚀 解析して指示書を作成", type="primary"):
         with st.spinner("🔍 ページ単位で高精度解析中..."):
             reader = load_ocr_reader()
+            clean_master = build_clean_master(st.session_state.target_master)
             all_items = []
             latest_date = ""
 
@@ -356,14 +360,14 @@ if uploaded_files:
                         image = page.render(scale=2).to_pil()
                         img_np = np.array(image)
                         res = reader.readtext(img_np, detail=1)
-                        p_items, p_date = parse_single_page(res)
+                        p_items, p_date, _ = parse_single_page(res, clean_master)
                         all_items.extend(p_items)
                         if p_date:
                             latest_date = p_date
                 else:
                     img = cv2.imdecode(np.frombuffer(file_bytes, np.uint8), cv2.IMREAD_COLOR)
                     res = reader.readtext(img, detail=1)
-                    p_items, p_date = parse_single_page(res)
+                    p_items, p_date, _ = parse_single_page(res, clean_master)
                     all_items.extend(p_items)
                     if p_date:
                         latest_date = p_date
