@@ -1,0 +1,6 @@
+streamlit
+easyocr
+opencv-python-headless
+openpyxl
+pypdfium2
+reportlab
