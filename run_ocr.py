@@ -18,7 +18,7 @@ from reportlab.lib import colors
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.pdfbase import pdfmetrics
-from reportlab.pdfbase.ttfonts import TTFont
+from reportlab.pdfbase.cidfonts import UnicodeCIDFont
 
 # ページの基本設定
 st.set_page_config(page_title="ピッキングリスト自動解析＆シール指示ツール", layout="wide")
@@ -26,22 +26,19 @@ st.set_page_config(page_title="ピッキングリスト自動解析＆シール�
 st.title("📦 パイオニアラベル貼付 作業指示解析ツール")
 st.write("ピッキングリスト（PDF / 画像）を読み込み、**「作業時間記録Excel」** と **「現場用 印刷指示シート(PDF)」** を自動生成します。")
 
-# --- 日本語フォント設定 ---
-FONT_NAME = "Helvetica"
-font_file = "IPAexGothic.ttf"
-if os.path.exists(font_file):
-    try:
-        pdfmetrics.registerFont(TTFont("IPAexGothic", font_file))
-        FONT_NAME = "IPAexGothic"
-    except Exception:
-        FONT_NAME = "Helvetica"
+# --- 日本語標準フォントの強制登録 ---
+FONT_NAME = "HeiseiKakuGo-W5"
+try:
+    pdfmetrics.registerFont(UnicodeCIDFont("HeiseiKakuGo-W5"))
+except Exception:
+    FONT_NAME = "Helvetica" # フォールバック
 
 # --- OCRモデルのキャッシュ化 ---
 @st.cache_resource
 def load_ocr_reader():
     return easyocr.Reader(['en'], gpu=False)
 
-# --- 対象品番マスター（ハイフン除去版キーとのマッピング） ---
+# --- 対象品番マスター ---
 TARGET_MASTER = {
     "99092-77R23-N02": "AD-1957ZS/JP",
     "99092-84UR5-N01": "AD-1957ZS02/JP",
@@ -69,12 +66,10 @@ TARGET_MASTER = {
 }
 
 def clean_code(s):
-    """記号を取り除き英大文字数字のみにする（O->0, I->1置換含む）"""
     s = str(s).upper()
     s = re.sub(r'[^A-Z0-9]', '', s)
     return s.replace('O', '0').replace('I', '1').replace('Z', '2')
 
-# マスターの比較用辞書を作成
 CLEAN_MASTER = {}
 for s_code, p_code in TARGET_MASTER.items():
     s_clean = clean_code(s_code)
@@ -97,11 +92,9 @@ def parse_picking_list_strict(ocr_results):
             'x': x_left
         })
 
-    # 指示日抽出 (例: 26/09/14)
     date_match = re.search(r'(\d{2,4}/\d{1,2}/\d{1,2})', full_text)
     date_val = date_match.group(1) if date_match else ""
 
-    # Y座標（高さ）ごとにグループ化 (行の判定: 誤差20px)
     parsed_boxes.sort(key=lambda b: b['y'])
     rows = []
     for box in parsed_boxes:
@@ -117,9 +110,8 @@ def parse_picking_list_strict(ocr_results):
 
     found_items = []
 
-    # 各行ごとに「原本にマスター品番が存在するか」を厳密にチェック
     for row in rows:
-        row_items = sorted(row['items'], key=lambda b: b['x']) # X座標左から順
+        row_items = sorted(row['items'], key=lambda b: b['x'])
         
         hit_master = None
         hit_idx = -1
@@ -129,7 +121,6 @@ def parse_picking_list_strict(ocr_results):
             if len(c_text) < 5:
                 continue
             
-            # 原本上の文字がマスターに含まれるか判定
             for m_clean, (s_orig, p_orig) in CLEAN_MASTER.items():
                 if m_clean in c_text or c_text in m_clean:
                     hit_master = (s_orig, p_orig)
@@ -142,14 +133,12 @@ def parse_picking_list_strict(ocr_results):
             s_code, p_code = hit_master
             qty = ""
             
-            # 品番の右側にある数値（指示数）を取得
             for item in row_items[hit_idx + 1:]:
                 txt = item['text'].replace(',', '').replace(' ', '')
                 if txt.isdigit() and 1 <= int(txt) <= 9999:
                     qty = int(txt)
                     break
             
-            # すでに登録済みでなければ追加
             if qty != "" and not any(x["スズキ品番"] == s_code for x in found_items):
                 found_items.append({
                     "指示日": date_val,
@@ -160,7 +149,7 @@ def parse_picking_list_strict(ocr_results):
 
     return found_items, date_val
 
-# --- 印刷用PDF生成関数 ---
+# --- 印刷用日本語PDF生成関数 ---
 def create_instruction_pdf(items, date_val):
     buffer = io.BytesIO()
     doc = SimpleDocTemplate(
@@ -169,10 +158,8 @@ def create_instruction_pdf(items, date_val):
     elements = []
     styles = getSampleStyleSheet()
 
-    is_jp = (FONT_NAME == "IPAexGothic")
-
-    title_text = "<b>【作業指示書】 パイオニアラベル貼付作業</b>" if is_jp else "<b>[ WORK INSTRUCTION ] Pioneer Label Attachment</b>"
-    sub_text = f"指示日: <b>{date_val if date_val else '未特定'}</b> &nbsp;&nbsp;|&nbsp;&nbsp; 発行日時: {datetime.now().strftime('%Y/%m/%d %H:%M')}" if is_jp else f"Date: <b>{date_val if date_val else 'N/A'}</b> &nbsp;&nbsp;|&nbsp;&nbsp; Issued: {datetime.now().strftime('%Y/%m/%d %H:%M')}"
+    title_text = "<b>【作業指示書】 パイオニアラベル貼付作業</b>"
+    sub_text = f"指示日: <b>{date_val if date_val else '未特定'}</b> &nbsp;&nbsp;|&nbsp;&nbsp; 発行日時: {datetime.now().strftime('%Y/%m/%d %H:%M')}"
     
     title_style = ParagraphStyle('TitlePDF', parent=styles['Heading1'], fontName=FONT_NAME, fontSize=16, leading=20, alignment=1)
     sub_style = ParagraphStyle('SubPDF', parent=styles['Normal'], fontName=FONT_NAME, fontSize=10, leading=14, alignment=1)
@@ -185,20 +172,16 @@ def create_instruction_pdf(items, date_val):
     elements.append(Spacer(1, 12))
 
     if not items:
-        no_item_msg = "<b>本日、パイオニアラベル貼付の対象品番はありません。</b>" if is_jp else "<b>No target items today.</b>"
+        no_item_msg = "<b>本日、パイオニアラベル貼付の対象品番はありません。</b>"
         elements.append(Paragraph(f"<font color='blue' size=12>{no_item_msg}</font>", sub_style))
     else:
-        if is_jp:
-            col_headers = ["No", "スズキ品番", "パイオニア品番", "指示数", "枚数", "作業指示", "完了チェック"]
-        else:
-            col_headers = ["No", "Suzuki Part No", "Pioneer Part No", "Qty", "Sheets", "Instruction", "Check"]
-
+        col_headers = ["No", "スズキ品番", "パイオニア品番", "指示数", "枚数", "作業指示", "完了チェック"]
         table_data = [[Paragraph(f"<b>{h}</b>", cell_bold) for h in col_headers]]
 
         for idx, item in enumerate(items, 1):
-            inst_text = "<font color='green'><b>【シール貼付】</b></font>" if is_jp else "<font color='green'><b>[ ATTACH LABEL ]</b></font>"
-            check_text = "[  ] 完了" if is_jp else "[  ] OK"
-            unit_text = "個" if is_jp else "pcs"
+            inst_text = "<font color='green'><b>【シール貼付】</b></font>"
+            check_text = "[  ] 完了"
+            unit_text = "個"
 
             table_data.append([
                 Paragraph(str(idx), cell_style),
@@ -326,7 +309,7 @@ if uploaded_file is not None:
     file_bytes = uploaded_file.read()
 
     if st.button("🚀 解析して指示書を作成", type="primary"):
-        with st.spinner("🔍 画像から文字と位置を解析中（厳密照合OCR処理）..."):
+        with st.spinner("🔍 画像から文字と位置を解析中（日本語指示書作成中）..."):
             reader = load_ocr_reader()
             ocr_results = []
 
