@@ -10,23 +10,12 @@ from datetime import datetime
 import numpy as np
 import io
 import pypdfium2 as pdfium
-import os
 
-# PDF生成ライブラリ & 日本語フォント登録
+# PDF生成ライブラリ
 from reportlab.lib.pagesizes import A4
 from reportlab.lib import colors
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.pdfbase import pdfmetrics
-from reportlab.pdfbase.ttfonts import TTFont
-
-# --- 日本語フォントの登録 ---
-font_path = "C:\\Windows\\Fonts\\msgothic.ttc"
-if os.path.exists(font_path):
-    pdfmetrics.registerFont(TTFont("MSGothic", font_path, subfontIndex=0))
-    JAPANESE_FONT = "MSGothic"
-else:
-    JAPANESE_FONT = "Helvetica"
 
 # ページの基本設定
 st.set_page_config(page_title="ピッキングリスト自動解析＆シール指示ツール", layout="wide")
@@ -72,7 +61,7 @@ def load_ocr_reader():
 
 reader = load_ocr_reader()
 
-# --- 日本語対応 印刷用PDF生成関数 ---
+# --- クラッシュ回避版 印刷用PDF生成関数 ---
 def create_instruction_pdf(items, date_val):
     buffer = io.BytesIO()
     doc = SimpleDocTemplate(
@@ -87,38 +76,39 @@ def create_instruction_pdf(items, date_val):
     elements = []
     styles = getSampleStyleSheet()
 
-    title_style = ParagraphStyle('TitleJP', parent=styles['Heading1'], fontName=JAPANESE_FONT, fontSize=20, leading=24, alignment=1)
-    sub_style = ParagraphStyle('SubJP', parent=styles['Normal'], fontName=JAPANESE_FONT, fontSize=11, leading=15, alignment=1)
-    cell_style = ParagraphStyle('CellJP', parent=styles['Normal'], fontName=JAPANESE_FONT, fontSize=10, leading=13)
-    cell_bold = ParagraphStyle('CellBoldJP', parent=styles['Normal'], fontName=JAPANESE_FONT, fontSize=11, leading=14)
+    # 標準フォントで崩れないスタイル設定
+    title_style = ParagraphStyle('TitleJP', parent=styles['Heading1'], fontSize=18, leading=22, alignment=1)
+    sub_style = ParagraphStyle('SubJP', parent=styles['Normal'], fontSize=10, leading=14, alignment=1)
+    cell_style = ParagraphStyle('CellJP', parent=styles['Normal'], fontSize=9, leading=12)
+    cell_bold = ParagraphStyle('CellBoldJP', parent=styles['Normal'], fontSize=10, leading=13)
 
-    elements.append(Paragraph("<b>【現場添付用】パイオニアラベル貼付 作業指示書</b>", title_style))
+    elements.append(Paragraph("<b>[WORK INSTRUCTION] Pioneer Label Attachment</b>", title_style))
     elements.append(Spacer(1, 8))
-    elements.append(Paragraph(f"指示日: <b>{date_val if date_val else '未指定'}</b> &nbsp;&nbsp;|&nbsp;&nbsp; 発行日時: {datetime.now().strftime('%Y/%m/%d %H:%M')}", sub_style))
+    elements.append(Paragraph(f"Date: <b>{date_val if date_val else 'N/A'}</b> &nbsp;&nbsp;|&nbsp;&nbsp; Issued: {datetime.now().strftime('%Y/%m/%d %H:%M')}", sub_style))
     elements.append(Spacer(1, 12))
 
     if not items:
-        elements.append(Paragraph("<font color='blue' size=14><b>本日のリストにシール貼付対象品番はありません（作業不要）。</b></font>", sub_style))
+        elements.append(Paragraph("<font color='blue' size=12><b>No target items for label attachment today.</b></font>", sub_style))
     else:
         table_data = [[
             Paragraph("<b>No</b>", cell_bold),
-            Paragraph("<b>スズキ品番</b>", cell_bold),
-            Paragraph("<b>パイオニア品番</b>", cell_bold),
-            Paragraph("<b>指示数</b>", cell_bold),
-            Paragraph("<b>枚数</b>", cell_bold),
-            Paragraph("<b>シール貼付指示</b>", cell_bold),
-            Paragraph("<b>完了チェック</b>", cell_bold)
+            Paragraph("<b>Suzuki Part No</b>", cell_bold),
+            Paragraph("<b>Pioneer Part No</b>", cell_bold),
+            Paragraph("<b>Qty</b>", cell_bold),
+            Paragraph("<b>Sheets</b>", cell_bold),
+            Paragraph("<b>Instruction</b>", cell_bold),
+            Paragraph("<b>Check</b>", cell_bold)
         ]]
 
         for idx, item in enumerate(items, 1):
             table_data.append([
                 Paragraph(str(idx), cell_style),
-                Paragraph(f"<b><font size=11>{item['スズキ品番']}</font></b>", cell_style),
-                Paragraph(item['パイオ品番'], cell_style),
-                Paragraph(f"<b><font size=12 color='red'>{item['指示数']} 個</font></b>", cell_style),
+                Paragraph(f"<b><font size=10>{item['スズキ品番']}</font></b>", cell_style),
+                Paragraph(str(item['パイオ品番']), cell_style),
+                Paragraph(f"<b><font size=11 color='red'>{item['指示数']} pcs</font></b>", cell_style),
                 Paragraph("", cell_style),
-                Paragraph("<font color='green'><b>【 貼 付 あり 】</b></font>", cell_bold),
-                Paragraph("[ &nbsp; ] 貼付完了", cell_style)
+                Paragraph("<font color='green'><b>[ ATTACH LABEL ]</b></font>", cell_bold),
+                Paragraph("[  ] Done", cell_style)
             ])
 
         t = Table(table_data, colWidths=[25, 125, 125, 55, 55, 95, 75])
@@ -227,7 +217,6 @@ def create_excel(items):
 
 uploaded_file = st.file_uploader("ピッキングリスト（PDF / 画像）をアップロードしてください", type=["pdf", "jpg", "jpeg", "png"])
 
-# 新しいファイルがアップロードされたら過去の解析結果をクリア
 if uploaded_file is not None:
     if "file_name" not in st.session_state or st.session_state.file_name != uploaded_file.name:
         st.session_state.file_name = uploaded_file.name
@@ -319,7 +308,7 @@ if uploaded_file is not None:
             st.session_state.parsed_items = items
             st.session_state.parsed_date = date_val
 
-    # 解析データが存在する場合（ダウンロード時も画面を維持する）
+    # 解析データが存在する場合（画面を維持）
     if "parsed_items" in st.session_state and st.session_state.parsed_items is not None:
         items = st.session_state.parsed_items
         date_val = st.session_state.parsed_date
