@@ -11,7 +11,6 @@ import numpy as np
 import io
 import os
 import pypdfium2 as pdfium
-from difflib import SequenceMatcher
 
 # PDF生成ライブラリ
 from reportlab.lib.pagesizes import A4
@@ -21,10 +20,26 @@ from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.cidfonts import UnicodeCIDFont
 
+# ページの基本設定
 st.set_page_config(page_title="ピッキングリスト自動解析＆シール指示ツール", layout="wide")
 
-# 対象品番マスター
-DEFAULT_MASTER = {
+st.title("📦 パイオニアラベル貼付 作業指示解析ツール")
+st.write("ピッキングリスト（PDF / 画像）を読み込み、**「作業時間記録Excel」** と **「現場用 印刷指示シート(PDF)」** を自動生成します。")
+
+# --- 日本語標準フォントの強制登録 ---
+FONT_NAME = "HeiseiKakuGo-W5"
+try:
+    pdfmetrics.registerFont(UnicodeCIDFont("HeiseiKakuGo-W5"))
+except Exception:
+    FONT_NAME = "Helvetica" # フォールバック
+
+# --- OCRモデルのキャッシュ化 ---
+@st.cache_resource
+def load_ocr_reader():
+    return easyocr.Reader(['en'], gpu=False)
+
+# --- 対象品番マスター ---
+TARGET_MASTER = {
     "99092-77R23-N02": "AD-1957ZS/JP",
     "99092-84UR5-N01": "AD-1957ZS02/JP",
     "99000-79BP3-000": "AN-1327ZS",
@@ -34,10 +49,11 @@ DEFAULT_MASTER = {
     "99000-79Y27-PF1": "AN-ZH09ZS-71A",
     "99000-79BP4-000": "CD-1317ZS",
     "99000-79Y64-000": "CD-7756ZS-E1",
-    "99000-79X94-000": "CD-VRM200ZS-E1",
     "9909J-78RM5-N01": "CD-HM022ZSE1",
     "3A108-65T00-000": "CNMV-0159ZS/EU",
+    "3A108-65T01-000": "CNMV-0259ZS/EU",
     "3A108-65T10-000": "CNMV-0259ZS/AU",
+    "3A108-65T11-000": "CNMV-0259ZS02/AU",
     "99093-55ZR3-N03": "KJ-S103DKZSE1",
     "99000-79W33-000": "ND-ETC3367ZS",
     "99000-79X52-000": "RD-7446ZS",
@@ -49,83 +65,19 @@ DEFAULT_MASTER = {
     "9909N-80TY4-N01": "UD-1377ZSE6/WL"
 }
 
-st.sidebar.header("⚙️ マスター設定")
-if "target_master" not in st.session_state:
-    st.session_state.target_master = DEFAULT_MASTER
-
-with st.sidebar.expander("➕ 新規品番の追加", expanded=False):
-    new_s = st.text_input("スズキ品番 (例: 99000-79X94-000)")
-    new_p = st.text_input("社内部番/パイオニア品番 (例: CD-VRM200ZS-E1)")
-    if st.button("追加登録"):
-        if new_s and new_p:
-            st.session_state.target_master[new_s.strip()] = new_p.strip()
-            st.success(f"登録しました: {new_s} -> {new_p}")
-        else:
-            st.warning("両方の品番を入力してください")
-
-FONT_NAME = "HeiseiKakuGo-W5"
-try:
-    pdfmetrics.registerFont(UnicodeCIDFont("HeiseiKakuGo-W5"))
-except Exception:
-    FONT_NAME = "Helvetica"
-
-@st.cache_resource
-def load_ocr_reader():
-    return easyocr.Reader(['en'], gpu=False)
-
 def clean_code(s):
     s = str(s).upper()
     s = re.sub(r'[^A-Z0-9]', '', s)
-    s = s.replace('O', '0').replace('I', '1').replace('Z', '2').replace('S', '5')
-    return s
+    return s.replace('O', '0').replace('I', '1').replace('Z', '2')
 
-def build_clean_master(master_dict):
-    clean_list = []
-    for s_code, p_code in master_dict.items():
-        clean_list.append({
-            's_orig': s_code,
-            'p_orig': p_code,
-            's_clean': clean_code(s_code),
-            'p_clean': clean_code(p_code)
-        })
-    return clean_list
+CLEAN_MASTER = {}
+for s_code, p_code in TARGET_MASTER.items():
+    s_clean = clean_code(s_code)
+    p_clean = clean_code(p_code)
+    CLEAN_MASTER[s_clean] = (s_code, p_code)
+    CLEAN_MASTER[p_clean] = (s_code, p_code)
 
-def match_master(text, clean_master):
-    """社内部番重視 ＋ 末尾読み取り漏れ補正 ＋ 対象外仕様(XIJP)完全除外"""
-    raw_upper = text.upper()
-    c_text = clean_code(text)
-
-    if len(c_text) < 4:
-        return None
-
-    # 対象外仕様（XIJP, XI, 84SS3000）を絶対除外
-    if "XIJP" in raw_upper or "XI" in raw_upper or "84SS3000" in c_text:
-        return None
-
-    for m in clean_master:
-        p_cl = m['p_clean']
-        s_cl = m['s_clean']
-
-        # 1. 完全・部分一致
-        if p_cl in c_text or c_text in p_cl:
-            return (m['s_orig'], m['p_orig'])
-
-        # 2. 末尾枝番（E3等）がOCRで切れた場合の補正 (TSF1740ZS 等の前方一致)
-        if len(c_text) >= 7 and p_cl.startswith(c_text):
-            return (m['s_orig'], m['p_orig'])
-
-        # 3. スズキ品番からの補正
-        if s_cl in c_text or (len(c_text) >= 9 and s_cl.startswith(c_text)):
-            return (m['s_orig'], m['p_orig'])
-
-    # 類似度判定
-    for m in clean_master:
-        if SequenceMatcher(None, m['p_clean'], c_text).ratio() > 0.75:
-            return (m['s_orig'], m['p_orig'])
-
-    return None
-
-def parse_single_page(ocr_results, clean_master):
+def parse_picking_list_strict(ocr_results):
     parsed_boxes = []
     full_text = ""
     for item in ocr_results:
@@ -148,7 +100,7 @@ def parse_single_page(ocr_results, clean_master):
     for box in parsed_boxes:
         placed = False
         for row in rows:
-            if abs(row['y_mean'] - box['y']) < 14:
+            if abs(row['y_mean'] - box['y']) < 20:
                 row['items'].append(box)
                 row['y_mean'] = sum(b['y'] for b in row['items']) / len(row['items'])
                 placed = True
@@ -156,21 +108,25 @@ def parse_single_page(ocr_results, clean_master):
         if not placed:
             rows.append({'y_mean': box['y'], 'items': [box]})
 
-    page_items = []
+    found_items = []
 
     for row in rows:
         row_items = sorted(row['items'], key=lambda b: b['x'])
         
         hit_master = None
         hit_idx = -1
-        hit_x = 0
 
         for idx, item in enumerate(row_items):
-            hit = match_master(item['text'], clean_master)
-            if hit:
-                hit_master = hit
-                hit_idx = idx
-                hit_x = item['x']
+            c_text = item['clean']
+            if len(c_text) < 5:
+                continue
+            
+            for m_clean, (s_orig, p_orig) in CLEAN_MASTER.items():
+                if m_clean in c_text or c_text in m_clean:
+                    hit_master = (s_orig, p_orig)
+                    hit_idx = idx
+                    break
+            if hit_master:
                 break
 
         if hit_master:
@@ -178,24 +134,22 @@ def parse_single_page(ocr_results, clean_master):
             qty = ""
             
             for item in row_items[hit_idx + 1:]:
-                if item['x'] - hit_x > 400:
-                    continue
-                    
                 txt = item['text'].replace(',', '').replace(' ', '')
                 if txt.isdigit() and 1 <= int(txt) <= 9999:
                     qty = int(txt)
                     break
             
-            if qty != "":
-                page_items.append({
+            if qty != "" and not any(x["スズキ品番"] == s_code for x in found_items):
+                found_items.append({
                     "指示日": date_val,
                     "指示数": qty,
                     "スズキ品番": s_code,
                     "パイオ品番": p_code
                 })
 
-    return page_items, date_val
+    return found_items, date_val
 
+# --- 印刷用日本語PDF生成関数 ---
 def create_instruction_pdf(items, date_val):
     buffer = io.BytesIO()
     doc = SimpleDocTemplate(
@@ -254,6 +208,7 @@ def create_instruction_pdf(items, date_val):
     buffer.seek(0)
     return buffer
 
+# --- Excel生成関数 ---
 def create_excel(items):
     wb = openpyxl.Workbook()
     ws = wb.active
@@ -283,7 +238,7 @@ def create_excel(items):
         cell.fill = fill_header
         cell.border = border_cell
 
-    max_rows = max(18, len(items))
+    max_rows = 18
     for row_idx in range(1, max_rows + 1):
         r = row_idx + 3
         c0 = ws.cell(row=r, column=1, value=row_idx)
@@ -327,11 +282,11 @@ def create_excel(items):
     dv_people = DataValidation(type="list", formula1="=$AB$1:$AB$10", allow_blank=True)
 
     ws.add_data_validation(dv_date)
-    dv_date.add(f"B4:B{max_rows + 3}")
+    dv_date.add("B4:B21")
     ws.add_data_validation(dv_time)
-    dv_time.add(f"G4:H{max_rows + 3}")
+    dv_time.add("G4:H21")
     ws.add_data_validation(dv_people)
-    dv_people.add(f"J4:J{max_rows + 3}")
+    dv_people.add("J4:J21")
 
     column_widths = {"A": 5, "B": 14, "C": 12, "D": 10, "E": 20, "F": 22, "G": 12, "H": 12, "I": 14, "J": 10}
     for col_letter, width in column_widths.items():
@@ -343,42 +298,37 @@ def create_excel(items):
     return excel_buffer
 
 # --- メインUI ---
-st.title("📦 パイオニアラベル貼付 作業指示解析ツール")
-st.write("ピッキングリスト（PDF / 画像）を読み込み、**「作業時間記録Excel」** と **「現場用 印刷指示シート(PDF)」** を自動生成します。")
+uploaded_file = st.file_uploader("ピッキングリスト（PDF / 画像）をアップロードしてください", type=["pdf", "jpg", "jpeg", "png"])
 
-uploaded_files = st.file_uploader("ピッキングリスト（PDF / 画像）をアップロードしてください（複数選択可）", type=["pdf", "jpg", "jpeg", "png"], accept_multiple_files=True)
+if uploaded_file is not None:
+    if "file_name" not in st.session_state or st.session_state.file_name != uploaded_file.name:
+        st.session_state.file_name = uploaded_file.name
+        st.session_state.parsed_items = None
+        st.session_state.parsed_date = ""
 
-if uploaded_files:
+    file_bytes = uploaded_file.read()
+
     if st.button("🚀 解析して指示書を作成", type="primary"):
-        with st.spinner("🔍 ページ単位で高精度解析中..."):
+        with st.spinner("🔍 画像から文字と位置を解析中（日本語指示書作成中）..."):
             reader = load_ocr_reader()
-            clean_master = build_clean_master(st.session_state.target_master)
-            all_items = []
-            latest_date = ""
+            ocr_results = []
 
-            for file in uploaded_files:
-                file_bytes = file.read()
+            if uploaded_file.name.lower().endswith(".pdf"):
+                pdf = pdfium.PdfDocument(file_bytes)
+                for page in pdf:
+                    image = page.render(scale=2).to_pil()
+                    img_np = np.array(image)
+                    res = reader.readtext(img_np, detail=1)
+                    ocr_results.extend(res)
+            else:
+                img = cv2.imdecode(np.frombuffer(file_bytes, np.uint8), cv2.IMREAD_COLOR)
+                res = reader.readtext(img, detail=1)
+                ocr_results.extend(res)
 
-                if file.name.lower().endswith(".pdf"):
-                    pdf = pdfium.PdfDocument(file_bytes)
-                    for page in pdf:
-                        image = page.render(scale=2).to_pil()
-                        img_np = np.array(image)
-                        res = reader.readtext(img_np, detail=1)
-                        p_items, p_date = parse_single_page(res, clean_master)
-                        all_items.extend(p_items)
-                        if p_date:
-                            latest_date = p_date
-                else:
-                    img = cv2.imdecode(np.frombuffer(file_bytes, np.uint8), cv2.IMREAD_COLOR)
-                    res = reader.readtext(img, detail=1)
-                    p_items, p_date = parse_single_page(res, clean_master)
-                    all_items.extend(p_items)
-                    if p_date:
-                        latest_date = p_date
+            items, date_val = parse_picking_list_strict(ocr_results)
 
-            st.session_state.parsed_items = all_items
-            st.session_state.parsed_date = latest_date
+            st.session_state.parsed_items = items
+            st.session_state.parsed_date = date_val
 
     # 解析結果表示
     if "parsed_items" in st.session_state and st.session_state.parsed_items is not None:
@@ -397,14 +347,14 @@ if uploaded_files:
                 with col:
                     st.markdown(f"""
                     <div style="background-color: #E8F5E9; padding: 15px; border-radius: 10px; border-left: 8px solid #2E7D32; margin-bottom: 12px;">
-                        <span style="background-color: #2E7D32; color: white; padding: 3px 8px; border-radius: 5px; font-weight: bold; font-size: 14px;">🏷️ シール貼付あり (No.{idx+1})</span>
+                        <span style="background-color: #2E7D32; color: white; padding: 3px 8px; border-radius: 5px; font-weight: bold; font-size: 14px;">🏷️ シール貼付あり</span>
                         <h3 style="margin: 8px 0 4px 0; color: #1B5E20;">{item['スズキ品番']}</h3>
                         <p style="margin: 0; font-weight: bold; color: #333;">パイオ品番: {item['パイオ品番']}</p>
                         <p style="margin: 0; font-size: 18px; font-weight: bold; color: #C62828;">指示数量: {item['指示数']} 個</p>
                     </div>
                     """, unsafe_allow_html=True)
         else:
-            st.success("✅ **【シール貼付 不要】** 対象品番が含まれていません（作業なし）。")
+            st.success("✅ **【シール貼付 不要】** 本日のピッキングリストには対象品番が含まれていません（作業なし）。")
 
         st.divider()
 
