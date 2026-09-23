@@ -1,5 +1,6 @@
 import streamlit as st
 import cv2
+import easyocr
 import openpyxl
 from openpyxl.styles import Font, Alignment, Border, Side, PatternFill
 from openpyxl.worksheet.datavalidation import DataValidation
@@ -21,6 +22,12 @@ st.set_page_config(page_title="ピッキングリスト自動解析＆シール�
 
 st.title("📦 パイオニアラベル貼付 作業指示解析ツール")
 st.write("ピッキングリスト（PDF / 画像）を読み込み、**「作業時間記録Excel」** と **「現場用 印刷指示シート(PDF)」** を自動生成します。")
+
+# --- OCRモデルのキャッシュ化（メモリ節約のため英語指定） ---
+@st.cache_resource
+def load_ocr_reader():
+    # 英語(en)のみに限定してメモリ消費量を半減させ、Cloudでのクラッシュを防ぐ
+    return easyocr.Reader(['en'], gpu=False)
 
 # --- PDFに基づく対象品番マスター ---
 TARGET_MASTER = {
@@ -211,34 +218,48 @@ if uploaded_file is not None:
 
     file_bytes = uploaded_file.read()
 
-    if uploaded_file.name.lower().endswith(".pdf"):
-        pdf = pdfium.PdfDocument(file_bytes)
-        text_content = ""
-        for page in pdf:
-            text_page = page.get_textpage()
-            text_content += text_page.get_text_range() + "\n"
-        
-        st.success("PDFテキストをダイレクト読み込みしました！")
+    if st.button("🚀 解析して指示書を作成", type="primary"):
+        with st.spinner("🔍 画像から文字を解析中（OCR処理）..."):
+            reader = load_ocr_reader()
+            all_text_results = []
 
-        if st.button("🚀 解析して指示書を作成", type="primary"):
+            if uploaded_file.name.lower().endswith(".pdf"):
+                pdf = pdfium.PdfDocument(file_bytes)
+                for page in pdf:
+                    image = page.render(scale=2).to_pil()
+                    img_np = np.array(image)
+                    ocr_res = reader.readtext(img_np, detail=0)
+                    all_text_results.extend(ocr_res)
+            else:
+                img = cv2.imdecode(np.frombuffer(file_bytes, np.uint8), cv2.IMREAD_COLOR)
+                ocr_res = reader.readtext(img, detail=0)
+                all_text_results.extend(ocr_res)
+
+            full_text = " ".join(all_text_results)
+
             items = []
-            date_match = re.search(r'指示日\s*(\d{2,4}/\d{1,2}/\d{1,2})', text_content) or re.search(r'(\d{2,4}/\d{1,2}/\d{1,2})', text_content)
+            date_match = re.search(r'(\d{2,4}/\d{1,2}/\d{1,2})', full_text)
             date_val = date_match.group(1) if date_match else ""
 
             for s_code, p_code in TARGET_MASTER.items():
                 c_s = clean_str(s_code)
                 c_p = clean_str(p_code)
-                
-                lines = text_content.split("\n")
-                for line in lines:
-                    c_line = clean_str(line)
-                    if c_s[:7] in c_line or c_p[:8] in c_line:
+
+                for idx, text in enumerate(all_text_results):
+                    c_text = clean_str(text)
+                    if c_s[:7] in c_text or c_p[:8] in c_text:
                         qty = ""
-                        nums = re.findall(r'\b\d{1,4}\b', line)
-                        for n in nums:
-                            if int(n) not in [31, 471, 1535, 6100, 34]:
-                                qty = int(n)
+                        # 周辺のブロックから数字を探す
+                        search_range = all_text_results[max(0, idx-3):min(len(all_text_results), idx+4)]
+                        for near_text in search_range:
+                            nums = re.findall(r'\b\d{1,4}\b', near_text)
+                            for n in nums:
+                                if int(n) not in [31, 471, 1535, 6100, 34]:
+                                    qty = int(n)
+                                    break
+                            if qty:
                                 break
+
                         if not any(x["スズキ品番"] == s_code for x in items):
                             items.append({
                                 "指示日": date_val,
@@ -257,10 +278,10 @@ if uploaded_file is not None:
 
         st.divider()
         st.subheader("📋 本日のパイオニアラベル貼付指示（画面確認）")
-        
+
         if items:
             st.error(f"⚠️ **【シール貼付 作業あり】** 合計 {len(items)} 件の対象品番が検出されました。必ずラベルを貼ってください！")
-            
+
             cols = st.columns(2)
             for idx, item in enumerate(items):
                 col = cols[idx % 2]
