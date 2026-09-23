@@ -11,6 +11,7 @@ import numpy as np
 import io
 import os
 import pypdfium2 as pdfium
+from difflib import SequenceMatcher
 
 # PDF生成ライブラリ
 from reportlab.lib.pagesizes import A4
@@ -36,9 +37,7 @@ DEFAULT_MASTER = {
     "99000-79X94-000": "CD-VRM200ZS-E1",
     "9909J-78RM5-N01": "CD-HM022ZSE1",
     "3A108-65T00-000": "CNMV-0159ZS/EU",
-    "3A108-65T01-000": "CNMV-0259ZS/EU",
     "3A108-65T10-000": "CNMV-0259ZS/AU",
-    "3A108-65T11-000": "CNMV-0259ZS/AU",
     "99093-55ZR3-N03": "KJ-S103DKZSE1",
     "99000-79W33-000": "ND-ETC3367ZS",
     "99000-79X52-000": "RD-7446ZS",
@@ -75,7 +74,7 @@ def load_ocr_reader():
     return easyocr.Reader(['en'], gpu=False)
 
 def clean_code(s):
-    """ハイフン・記号を除去し英数字のみにする"""
+    """ハイフン・記号を除去し英数字のみにする（OCR誤読補正付き）"""
     s = str(s).upper()
     s = re.sub(r'[^A-Z0-9]', '', s)
     s = s.replace('O', '0').replace('I', '1').replace('Z', '2').replace('S', '5')
@@ -93,19 +92,29 @@ def build_clean_master(master_dict):
     return clean_list
 
 def match_master(text, clean_master):
-    """誤検知を防ぐ厳密マッチング"""
+    """対象外仕様（XIJP等）のみを除外し、OCR読み取り揺れを柔軟に救済するロジック"""
+    raw_upper = text.upper()
     c_text = clean_code(text)
 
-    if len(c_text) < 6:
+    if len(c_text) < 5:
         return None
 
-    # XIJPや非対象仕様を完全弾き
-    if "XIJP" in text.upper() or "XI" in text.upper():
+    # 対象外仕様（XIJP, XI, 84SS3000）を絶対弾き
+    if "XIJP" in raw_upper or "XI" in raw_upper or "84SS3000" in c_text:
         return None
 
-    # 完全一致のみ許可（部分一致を禁止して誤検出を防止）
+    # 1. 整理後コードでの前方一致・部分一致（枝番対応）
     for m in clean_master:
-        if c_text == m['s_clean'] or c_text == m['p_clean']:
+        if m['s_clean'] in c_text or m['p_clean'] in c_text:
+            return (m['s_orig'], m['p_orig'])
+        if c_text in m['s_clean'] and len(c_text) >= 8:
+            return (m['s_orig'], m['p_orig'])
+
+    # 2. 類似度判定（OCRの誤読を救済）
+    for m in clean_master:
+        ratio_s = SequenceMatcher(None, m['s_clean'], c_text).ratio()
+        ratio_p = SequenceMatcher(None, m['p_clean'], c_text).ratio()
+        if ratio_s > 0.78 or ratio_p > 0.78:
             return (m['s_orig'], m['p_orig'])
 
     return None
