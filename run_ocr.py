@@ -74,6 +74,8 @@ def load_ocr_reader():
 def clean_code(s):
     s = str(s).upper()
     s = re.sub(r'[^A-Z0-9]', '', s)
+    # 似た文字の相互置換で文字化けを吸収
+    s = s.replace('O', '0').replace('I', '1').replace('Z', '2').replace('S', '5')
     return s
 
 def build_clean_master(master_dict):
@@ -89,36 +91,36 @@ def build_clean_master(master_dict):
 
 def match_master(text, clean_master):
     raw_upper = text.upper().replace(' ', '').replace('-', '')
-    
-    # 認識文字列が短すぎる場合は無視
-    if len(raw_upper) < 3:
+    c_text = clean_code(text)
+
+    if len(c_text) < 3:
         return None
 
-    # XI/XIJP を含む例外品番の完全除外
+    # 絶対除外キーワード
     if "XIJP" in raw_upper or "XI" in raw_upper:
         return None
 
-    # =========================================================
-    # ★ TS-F1740ZSE3 / 9919D-84SS3-R00 超強力専用救済ロジック ★
-    # =========================================================
-    # 84SS3周辺のOCR化けパターン（84553, 84SS3, B4553, 84883など）または 1740ZSE/F1740
+    # 個別特殊救済ルール
     if re.search(r'(84[S58]{2}3|84SS3|1740|F1740)', raw_upper):
         return ("9919D-84SS3-R00", "TS-F1740ZSE3")
 
-    # ★ TS-F1640ZSE4 / 9919D-83ST3-R00 専用救済ロジック
     if re.search(r'(83[S55]T3|83ST3|1640|F1640)', raw_upper):
         return ("9919D-83ST3-R00", "TS-F1640ZSE4")
 
-    # 標準品番照合
-    c_text = clean_code(text)
+    # 汎用判定ルール（標準・文字化け両対応）
     for m in clean_master:
         p_cl = m['p_clean']
         s_cl = m['s_clean']
 
-        if p_cl in c_text or s_cl in c_text:
+        # 部分一致または相互包含チェック
+        if p_cl in c_text or c_text in p_cl:
             return (m['s_orig'], m['p_orig'])
 
-        if len(c_text) >= 6 and (c_text in p_cl or c_text in s_cl):
+        if s_cl in c_text or c_text in s_cl:
+            return (m['s_orig'], m['p_orig'])
+
+        # 6文字以上の部分一致判定（ハイフン崩れ等の対応）
+        if len(c_text) >= 5 and (c_text in p_cl or c_text in s_cl):
             return (m['s_orig'], m['p_orig'])
 
     return None
@@ -144,7 +146,7 @@ def parse_single_page(ocr_results, clean_master):
     date_match = re.search(r'(\d{2,4}/\d{1,2}/\d{1,2})', full_text)
     date_val = date_match.group(1) if date_match else ""
 
-    # Y軸グループ化（同一定義行の統合）
+    # Y軸グループ化（誤差22px）
     parsed_boxes.sort(key=lambda b: b['y'])
     rows = []
     for box in parsed_boxes:
@@ -164,43 +166,45 @@ def parse_single_page(ocr_results, clean_master):
         row_items = sorted(row['items'], key=lambda b: b['x'])
         
         hit_master = None
-        hit_idx = -1
-        hit_x = 0
 
-        # 単体＆隣接テキスト結合での判定
-        for idx, item in enumerate(row_items):
+        # 1. 単体要素でのマッチング
+        for item in row_items:
             hit = match_master(item['text'], clean_master)
             if hit:
                 hit_master = hit
-                hit_idx = idx
-                hit_x = item['x']
                 break
 
+        # 2. 隣接要素を2つ・3つ結合してのマッチング（細切れ対策）
         if not hit_master and len(row_items) > 1:
-            for idx in range(len(row_items) - 1):
-                comb = row_items[idx]['text'] + row_items[idx+1]['text']
-                hit = match_master(comb, clean_master)
+            for i in range(len(row_items) - 1):
+                comb2 = row_items[i]['text'] + row_items[i+1]['text']
+                hit = match_master(comb2, clean_master)
                 if hit:
                     hit_master = hit
-                    hit_idx = idx
-                    hit_x = row_items[idx]['x']
                     break
+                if i < len(row_items) - 2:
+                    comb3 = row_items[i]['text'] + row_items[i+1]['text'] + row_items[i+2]['text']
+                    hit = match_master(comb3, clean_master)
+                    if hit:
+                        hit_master = hit
+                        break
 
         if hit_master:
             s_code, p_code = hit_master
             qty = ""
             
-            # 数量探索（見つからない場合はデフォルトで1個）
+            # 行内の数値を数量として探す
             for item in row_items:
                 txt = item['text'].replace(',', '').replace(' ', '')
                 if txt.isdigit() and 1 <= int(txt) <= 999:
                     qty = int(txt)
                     break
             
+            # 見つからなければ1個とする
             if qty == "":
                 qty = 1
 
-            # 重複判定
+            # 行単位での重複追加を防ぐ
             is_dup = any(p['スズキ品番'] == s_code and p['指示数'] == qty for p in page_items)
             if not is_dup:
                 page_items.append({
@@ -366,7 +370,7 @@ uploaded_files = st.file_uploader("ピッキングリスト（PDF / 画像）を
 
 if uploaded_files:
     if st.button("🚀 解析して指示書を作成", type="primary"):
-        with st.spinner("🔍 超高精度判定で解析中..."):
+        with st.spinner("🔍 最終調整されたロジックで解析中..."):
             reader = load_ocr_reader()
             clean_master = build_clean_master(st.session_state.target_master)
             all_items = []
