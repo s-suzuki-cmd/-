@@ -55,7 +55,7 @@ if "target_master" not in st.session_state:
 
 with st.sidebar.expander("➕ 新規品番の追加", expanded=False):
     new_s = st.text_input("スズキ品番 (例: 99000-79X94-000)")
-    new_p = st.text_input("パイオニア品番 (例: CD-VRM200ZS-E1)")
+    new_p = st.text_input("社内部番/パイオニア品番 (例: CD-VRM200ZS-E1)")
     if st.button("追加登録"):
         if new_s and new_p:
             st.session_state.target_master[new_s.strip()] = new_p.strip()
@@ -74,7 +74,7 @@ def load_ocr_reader():
     return easyocr.Reader(['en'], gpu=False)
 
 def clean_code(s):
-    """ハイフン・記号を除去し英数字のみにする（OCR誤読補正付き）"""
+    """英数字のみ抽出し正規化（OCR誤読補正付き）"""
     s = str(s).upper()
     s = re.sub(r'[^A-Z0-9]', '', s)
     s = s.replace('O', '0').replace('I', '1').replace('Z', '2').replace('S', '5')
@@ -92,29 +92,29 @@ def build_clean_master(master_dict):
     return clean_list
 
 def match_master(text, clean_master):
-    """対象外仕様（XIJP等）のみを除外し、OCR読み取り揺れを柔軟に救済するロジック"""
+    """【社内部番（パイオニア品番）メインで判定するロジック】"""
     raw_upper = text.upper()
     c_text = clean_code(text)
 
-    if len(c_text) < 5:
+    if len(c_text) < 4:
         return None
 
-    # 対象外仕様（XIJP, XI, 84SS3000）を絶対弾き
-    if "XIJP" in raw_upper or "XI" in raw_upper or "84SS3000" in c_text:
+    # 非対象モデル（XIJP等）は明確に除外
+    if "XIJP" in raw_upper or "XI" in raw_upper:
         return None
 
-    # 1. 整理後コードでの前方一致・部分一致（枝番対応）
+    # 最優先: 社内部番（パイオニア品番）との照合
     for m in clean_master:
-        if m['s_clean'] in c_text or m['p_clean'] in c_text:
+        # パイオニア品番がテキストに含まれているか
+        if m['p_clean'] in c_text or c_text in m['p_clean']:
             return (m['s_orig'], m['p_orig'])
-        if c_text in m['s_clean'] and len(c_text) >= 8:
+        # 類似度判定（パイオニア品番の1文字誤読を救済）
+        if SequenceMatcher(None, m['p_clean'], c_text).ratio() > 0.80:
             return (m['s_orig'], m['p_orig'])
 
-    # 2. 類似度判定（OCRの誤読を救済）
+    # 補助判定: スズキ品番との完全・高精度一致（社内部番で引っかからなかった場合のみ）
     for m in clean_master:
-        ratio_s = SequenceMatcher(None, m['s_clean'], c_text).ratio()
-        ratio_p = SequenceMatcher(None, m['p_clean'], c_text).ratio()
-        if ratio_s > 0.78 or ratio_p > 0.78:
+        if m['s_clean'] in c_text and len(c_text) >= 10:
             return (m['s_orig'], m['p_orig'])
 
     return None
